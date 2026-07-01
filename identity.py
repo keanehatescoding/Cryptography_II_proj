@@ -47,25 +47,53 @@ class Identity:
         digest = hashlib.sha256(self.public_bytes).hexdigest()
         return ":".join(digest[i : i + 4] for i in range(0, 16, 4))
 
-    def save(self, directory: str):
-        """Persist the private key to disk (PEM, unencrypted for demo
-        purposes - production code should encrypt this at rest)."""
+    def save(self, directory: str, passphrase: str = None):
+        """Persist the private key to disk (PEM). If `passphrase` is
+        given, the key is encrypted at rest (PKCS8 password-based
+        encryption); otherwise it's written in the clear. Long-term
+        identity keys are high-value (they're what authentication rests
+        on), so encrypting them is strongly recommended over the demo
+        default of no encryption."""
         os.makedirs(directory, exist_ok=True)
         key_path = Path(directory) / f"{self.name}_identity.pem"
+        if passphrase:
+            encryption = serialization.BestAvailableEncryption(
+                passphrase.encode("utf-8")
+            )
+        else:
+            encryption = serialization.NoEncryption()
         pem = self.private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
+            encryption_algorithm=encryption,
         )
         key_path.write_bytes(pem)
         return str(key_path)
 
     @classmethod
-    def load(cls, name: str, directory: str) -> "Identity":
+    def load(cls, name: str, directory: str, passphrase: str = None) -> "Identity":
+        """Raises TypeError if the key on disk is encrypted but no
+        passphrase was given (or vice versa), and ValueError if a
+        passphrase was given but is wrong - callers should catch these
+        and re-prompt rather than treating them as fatal."""
         key_path = Path(directory) / f"{name}_identity.pem"
         pem = key_path.read_bytes()
-        private_key = serialization.load_pem_private_key(pem, password=None)
+        password = passphrase.encode("utf-8") if passphrase else None
+        private_key = serialization.load_pem_private_key(pem, password=password)
         return cls(name, private_key)
+
+    @staticmethod
+    def is_encrypted(name: str, directory: str) -> bool:
+        """Peek at a key file to see if it needs a passphrase, without
+        actually attempting to decrypt it - lets callers decide whether
+        to prompt for a passphrase before the first load attempt."""
+        key_path = Path(directory) / f"{name}_identity.pem"
+        pem = key_path.read_bytes()
+        try:
+            serialization.load_pem_private_key(pem, password=None)
+            return False
+        except TypeError:
+            return True
 
 
 class TrustStore:

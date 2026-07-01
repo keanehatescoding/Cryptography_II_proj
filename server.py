@@ -1,14 +1,19 @@
 """
 server.py
 ---------
-Demo server ("bob"). Runs the responder side of the handshake, then
-exchanges encrypted chat messages over the resulting SecureChannel.
+Demo server ("bob"). Loops accepting connections, running the responder
+side of the handshake for each, then exchanges encrypted chat messages
+over the resulting SecureChannel. A per-address rate limiter throttles
+repeated failed handshake attempts.
 
 Usage:
     python3 server.py
 """
 
+import getpass
 import socket
+import sys
+from pathlib import Path
 
 import transport
 from identity import Identity, TrustStore
@@ -20,39 +25,51 @@ from handshake import (
     HandshakeError,
 )
 from secure_channel import ReplayError, TamperError
+from rate_limiter import RateLimiter
 
 HOST, PORT = "127.0.0.1", 6543
 KEY_DIR = "./demo_keys"
 
 
 def load_or_create_identity(name: str) -> Identity:
-    try:
-        return Identity.load(name, KEY_DIR)
-    except FileNotFoundError:
+    key_path = Path(KEY_DIR) / f"{name}_identity.pem"
+
+    if not key_path.exists():
+        use_pass = (
+            input(f"Create identity '{name}'. Encrypt it with a passphrase? [Y/n]: ")
+            .strip()
+            .lower()
+        )
+        passphrase = None
+        if use_pass != "n":
+            passphrase = getpass.getpass("New passphrase: ")
+            confirm = getpass.getpass("Confirm passphrase: ")
+            if passphrase != confirm:
+                print("Passphrases did not match. Aborting.")
+                sys.exit(1)
         identity = Identity(name)
-        identity.save(KEY_DIR)
+        identity.save(KEY_DIR, passphrase=passphrase or None)
         return identity
 
+    if Identity.is_encrypted(name, KEY_DIR):
+        for _ in range(3):
+            passphrase = getpass.getpass(f"Passphrase for '{name}': ")
+            try:
+                return Identity.load(name, KEY_DIR, passphrase=passphrase)
+            except ValueError:
+                print("Incorrect passphrase.")
+        print("Too many incorrect attempts. Aborting.")
+        sys.exit(1)
 
-def main():
-    me = load_or_create_identity("bob")
-    trust_store = TrustStore.load(f"{KEY_DIR}/bob_trust.json")
+    return Identity.load(name, KEY_DIR)
 
-    print(f"[bob] identity fingerprint: {me.fingerprint}")
-    print("[bob] waiting for 'alice' to connect and share her identity...")
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(1)
-    conn, addr = srv.accept()
-    print(f"[bob] connection from {addr}")
-
+def handle_connection(
+    conn, addr, me: Identity, trust_store: TrustStore, limiter: RateLimiter
+):
+    ip = addr[0]
     try:
         # --- TOFU: on first contact, learn and pin the peer's public key ---
-        # (In a real system this pinning step would require independent
-        # out-of-band verification of the fingerprint - e.g. reading it
-        # aloud over a phone call - to actually prevent MITM on first use.)
         peer_intro = transport.recv_json(conn)
         peer_name = peer_intro["name"]
         peer_pubkey = bytes.fromhex(peer_intro["identity_pub"])
@@ -66,7 +83,7 @@ def main():
                 f"public key than the one we have pinned. Possible "
                 f"impersonation. Aborting."
             )
-            conn.close()
+            limiter.record_failure(ip)
             return
 
         transport.send_json(
@@ -79,6 +96,7 @@ def main():
         transport.send_json(conn, msg2.to_wire())
         msg3 = HandshakeMessage3.from_wire(transport.recv_json(conn))
         channel = responder_finish(trust_store, state, msg3)
+        limiter.record_success(ip)
 
         print("[bob] handshake complete - mutual authentication succeeded.")
         print("[bob] session secured with AES-256-GCM. Type messages below.\n")
@@ -92,7 +110,7 @@ def main():
                 print(f"[bob] SECURITY ALERT: {e}")
                 continue
             text = plaintext.decode("utf-8")
-            print(f"[alice] {text}")
+            print(f"[{peer_name}] {text}")
             if text.strip().lower() == "/quit":
                 break
             reply = input("[bob] > ")
@@ -102,10 +120,44 @@ def main():
 
     except HandshakeError as e:
         print(f"[bob] HANDSHAKE FAILED: {e}")
+        limiter.record_failure(ip)
     except (ConnectionError, OSError) as e:
         print(f"[bob] connection error: {e}")
     finally:
         conn.close()
+
+
+def main():
+    me = load_or_create_identity("bob")
+    trust_store = TrustStore.load(f"{KEY_DIR}/bob_trust.json")
+    limiter = RateLimiter(max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0)
+
+    print(f"[bob] identity fingerprint: {me.fingerprint}")
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(5)
+    print(f"[bob] listening on {HOST}:{PORT} - Ctrl+C to stop.")
+
+    try:
+        while True:
+            conn, addr = srv.accept()
+            ip = addr[0]
+            if limiter.is_blocked(ip):
+                wait = limiter.seconds_until_unblocked(ip)
+                print(
+                    f"[bob] rejecting {ip} - rate-limited for another "
+                    f"{wait:.0f}s after repeated failed attempts."
+                )
+                conn.close()
+                continue
+            print(f"[bob] connection from {addr}")
+            handle_connection(conn, addr, me, trust_store, limiter)
+            print("[bob] connection ended. Waiting for next peer...\n")
+    except KeyboardInterrupt:
+        print("\n[bob] shutting down.")
+    finally:
         srv.close()
 
 

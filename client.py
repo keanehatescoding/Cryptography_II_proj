@@ -8,7 +8,10 @@ Usage:
     python3 client.py
 """
 
+import getpass
 import socket
+import sys
+from pathlib import Path
 
 import transport
 from identity import Identity, TrustStore
@@ -25,12 +28,36 @@ KEY_DIR = "./demo_keys"
 
 
 def load_or_create_identity(name: str) -> Identity:
-    try:
-        return Identity.load(name, KEY_DIR)
-    except FileNotFoundError:
+    key_path = Path(KEY_DIR) / f"{name}_identity.pem"
+
+    if not key_path.exists():
+        use_pass = (
+            input(f"Create identity '{name}'. Encrypt it with a passphrase? [Y/n]: ")
+            .strip()
+            .lower()
+        )
+        passphrase = None
+        if use_pass != "n":
+            passphrase = getpass.getpass("New passphrase: ")
+            confirm = getpass.getpass("Confirm passphrase: ")
+            if passphrase != confirm:
+                print("Passphrases did not match. Aborting.")
+                sys.exit(1)
         identity = Identity(name)
-        identity.save(KEY_DIR)
+        identity.save(KEY_DIR, passphrase=passphrase or None)
         return identity
+
+    if Identity.is_encrypted(name, KEY_DIR):
+        for _ in range(3):
+            passphrase = getpass.getpass(f"Passphrase for '{name}': ")
+            try:
+                return Identity.load(name, KEY_DIR, passphrase=passphrase)
+            except ValueError:
+                print("Incorrect passphrase.")
+        print("Too many incorrect attempts. Aborting.")
+        sys.exit(1)
+
+    return Identity.load(name, KEY_DIR)
 
 
 def main():

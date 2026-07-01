@@ -21,6 +21,7 @@ import socket
 import threading
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 import transport
@@ -35,18 +36,31 @@ from handshake import (
     responder_respond,
 )
 from identity import Identity, TrustStore
+from rate_limiter import RateLimiter
 from secure_channel import ReplayError, TamperError
 
 KEY_DIR = "./gui_keys"
 
 
-def load_or_create_identity(name: str) -> Identity:
-    try:
-        return Identity.load(name, KEY_DIR)
-    except FileNotFoundError:
+class PassphraseNeeded(Exception):
+    """Raised by load_or_create_identity when a passphrase must be
+    collected from the GUI before an identity can be loaded/created."""
+
+
+def load_or_create_identity(name: str, passphrase: str = None) -> Identity:
+    key_path_exists = (Path(KEY_DIR) / f"{name}_identity.pem").exists()
+
+    if not key_path_exists:
         identity = Identity(name)
-        identity.save(KEY_DIR)
+        identity.save(KEY_DIR, passphrase=passphrase or None)
         return identity
+
+    if Identity.is_encrypted(name, KEY_DIR):
+        if not passphrase:
+            raise PassphraseNeeded("This identity is passphrase-protected.")
+        return Identity.load(name, KEY_DIR, passphrase=passphrase)
+
+    return Identity.load(name, KEY_DIR)
 
 
 def fingerprint_from_bytes(raw: bytes) -> str:
@@ -62,13 +76,22 @@ class PeerWorker(threading.Thread):
     supplies an answer - this keeps Tk's single-threaded UI rule intact
     while still letting the crypto/network code run synchronously."""
 
-    def __init__(self, name: str, role: str, host: str, port: int, events: queue.Queue):
+    def __init__(
+        self,
+        name: str,
+        role: str,
+        host: str,
+        port: int,
+        events: queue.Queue,
+        passphrase: str = None,
+    ):
         super().__init__(daemon=True)
         self.name = name
         self.role = role  # "host" or "connect"
         self.host = host
         self.port = port
         self.events = events
+        self.passphrase = passphrase or None
         self.sock = None
         self.channel = None
         self.peer_name = None
@@ -79,7 +102,7 @@ class PeerWorker(threading.Thread):
 
     def run(self):
         try:
-            self.identity = load_or_create_identity(self.name)
+            self.identity = load_or_create_identity(self.name, self.passphrase)
             self.trust_store = TrustStore.load(f"{KEY_DIR}/{self.name}_trust.json")
             self.emit("identity", fingerprint=self.identity.fingerprint)
 
@@ -87,6 +110,16 @@ class PeerWorker(threading.Thread):
                 self._run_host()
             else:
                 self._run_connect()
+        except PassphraseNeeded:
+            self.emit(
+                "error",
+                text="This identity is passphrase-protected. "
+                "Enter the passphrase and try again.",
+            )
+            return
+        except ValueError:
+            self.emit("error", text="Incorrect passphrase.")
+            return
         except HandshakeError as e:
             self.emit("error", text=f"Handshake failed: {e}")
             return
@@ -106,20 +139,58 @@ class PeerWorker(threading.Thread):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
-        srv.listen(1)
-        conn, addr = srv.accept()
+        srv.listen(5)
+
+        # Persists across repeated connection attempts on this listen
+        # socket, so a peer who fails the handshake a few times in a row
+        # gets throttled rather than allowed unlimited retries.
+        limiter = RateLimiter(
+            max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0
+        )
+
+        while not self._stop.is_set():
+            conn, addr = srv.accept()
+            ip = addr[0]
+            if limiter.is_blocked(ip):
+                wait = limiter.seconds_until_unblocked(ip)
+                self.emit(
+                    "status",
+                    text=f"Rejected connection from {ip} - "
+                    f"rate-limited for {wait:.0f}s more "
+                    f"after repeated failed attempts.",
+                )
+                conn.close()
+                continue
+
+            self.sock = conn
+            self.emit("status", text=f"Connection from {addr[0]}:{addr[1]}")
+
+            try:
+                self._exchange_identity_and_pin()
+                msg1 = HandshakeMessage1.from_wire(transport.recv_json(self.sock))
+                msg2, state = responder_respond(self.identity, msg1)
+                transport.send_json(self.sock, msg2.to_wire())
+                msg3 = HandshakeMessage3.from_wire(transport.recv_json(self.sock))
+                self.channel = responder_finish(self.trust_store, state, msg3)
+            except HandshakeError as e:
+                limiter.record_failure(ip)
+                self.emit(
+                    "status",
+                    text=f"Handshake with {ip} failed ({e}). Waiting for next peer...",
+                )
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+                continue
+
+            limiter.record_success(ip)
+            self.emit("handshake_done")
+            srv.close()
+            return
+
         srv.close()
-        self.sock = conn
-        self.emit("status", text=f"Connection from {addr[0]}:{addr[1]}")
-
-        self._exchange_identity_and_pin()
-
-        msg1 = HandshakeMessage1.from_wire(transport.recv_json(self.sock))
-        msg2, state = responder_respond(self.identity, msg1)
-        transport.send_json(self.sock, msg2.to_wire())
-        msg3 = HandshakeMessage3.from_wire(transport.recv_json(self.sock))
-        self.channel = responder_finish(self.trust_store, state, msg3)
-        self.emit("handshake_done")
 
     def _run_connect(self):
         self.emit("status", text=f"Connecting to {self.host}:{self.port}...")
@@ -273,6 +344,19 @@ class SecureCommsApp(tk.Tk):
             row=2, column=1, sticky="ew", pady=4
         )
 
+        ttk.Label(form, text="Passphrase:").grid(row=3, column=0, sticky="w", pady=4)
+        self.passphrase_var = tk.StringVar(value="")
+        ttk.Entry(form, textvariable=self.passphrase_var, show="*").grid(
+            row=3, column=1, sticky="ew", pady=4
+        )
+        ttk.Label(
+            frame,
+            text="Leave blank for a new/unencrypted identity. Required "
+            "if this name's identity key is passphrase-protected.",
+            foreground="#888",
+            font=("", 8),
+        ).pack(anchor="w", pady=(0, 4))
+
         btns = ttk.Frame(frame)
         btns.pack(fill="x", pady=16)
         self.host_btn = ttk.Button(
@@ -348,7 +432,10 @@ class SecureCommsApp(tk.Tk):
         self.host_btn.state(["disabled"])
         self.connect_btn.state(["disabled"])
         self.status_var.set("Starting...")
-        self.worker = PeerWorker(name, role, host, port, self.events)
+        passphrase = self.passphrase_var.get() or None
+        self.worker = PeerWorker(
+            name, role, host, port, self.events, passphrase=passphrase
+        )
         self.worker.start()
 
     def _send(self):

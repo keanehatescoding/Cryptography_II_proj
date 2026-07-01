@@ -103,18 +103,52 @@ def test_replayed_message_is_rejected():
         bob_channel.decrypt(ct)
 
 
-def test_reordered_message_is_rejected():
+def test_reordered_messages_within_window_are_accepted():
+    """Sliding-window replay protection tolerates real reordering -
+    this is the key behavioral difference from a strict sequential
+    counter check."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+
+    ct1 = alice_channel.encrypt(b"first")
+    ct2 = alice_channel.encrypt(b"second")
+    ct3 = alice_channel.encrypt(b"third")
+
+    # deliver out of order: 2, 1, 3
+    assert bob_channel.decrypt(ct2) == b"second"
+    assert bob_channel.decrypt(ct1) == b"first"
+    assert bob_channel.decrypt(ct3) == b"third"
+
+
+def test_replaying_an_out_of_order_message_still_rejected():
     alice, bob, alice_trust, bob_trust = make_pinned_pair()
     alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
 
     ct1 = alice_channel.encrypt(b"first")
     ct2 = alice_channel.encrypt(b"second")
 
-    # deliver out of order
+    assert bob_channel.decrypt(ct2) == b"second"
+    assert bob_channel.decrypt(ct1) == b"first"
+    # both already seen - replaying either must fail
+    with pytest.raises(ReplayError):
+        bob_channel.decrypt(ct1)
     with pytest.raises(ReplayError):
         bob_channel.decrypt(ct2)
-    # ct1 would still be accepted since counters are checked strictly
-    assert bob_channel.decrypt(ct1) == b"first"
+
+
+def test_message_older_than_window_is_rejected():
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    # small window for a fast, deterministic test
+    bob_channel._window_size = 4
+    bob_channel._window_mask = (1 << 4) - 1
+
+    old_ct = alice_channel.encrypt(b"will go stale")
+    for i in range(10):
+        bob_channel.decrypt(alice_channel.encrypt(f"filler {i}".encode()))
+
+    with pytest.raises(ReplayError):
+        bob_channel.decrypt(old_ct)
 
 
 def test_impersonation_without_private_key_fails():
@@ -164,6 +198,117 @@ def test_forward_secrecy_ephemeral_keys_are_fresh_each_time():
 
     assert channel_a1._send_key != channel_a2._send_key
     assert channel_b1._send_key != channel_b2._send_key
+
+
+import tempfile
+import shutil
+
+from rate_limiter import RateLimiter
+
+
+# ---------------------------------------------------------------------------
+# Identity key encryption at rest
+# ---------------------------------------------------------------------------
+
+
+def test_identity_saved_without_passphrase_is_not_encrypted():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        alice = Identity("alice")
+        alice.save(tmpdir)
+        assert Identity.is_encrypted("alice", tmpdir) is False
+        loaded = Identity.load("alice", tmpdir)
+        assert loaded.fingerprint == alice.fingerprint
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_identity_saved_with_passphrase_is_encrypted_and_roundtrips():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bob = Identity("bob")
+        bob.save(tmpdir, passphrase="correct horse battery staple")
+        assert Identity.is_encrypted("bob", tmpdir) is True
+        loaded = Identity.load("bob", tmpdir, passphrase="correct horse battery staple")
+        assert loaded.fingerprint == bob.fingerprint
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_identity_wrong_passphrase_rejected():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bob = Identity("bob")
+        bob.save(tmpdir, passphrase="correct horse battery staple")
+        with pytest.raises(ValueError):
+            Identity.load("bob", tmpdir, passphrase="wrong passphrase")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_identity_missing_passphrase_rejected():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bob = Identity("bob")
+        bob.save(tmpdir, passphrase="correct horse battery staple")
+        with pytest.raises(TypeError):
+            Identity.load("bob", tmpdir)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limiter_blocks_after_max_attempts():
+    rl = RateLimiter(max_attempts=3, window_seconds=60.0, cooldown_seconds=30.0)
+    t = 1000.0
+    assert not rl.is_blocked("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t + 1)
+    assert not rl.is_blocked("1.2.3.4", now=t + 1)
+    rl.record_failure("1.2.3.4", now=t + 2)  # 3rd failure -> blocked
+    assert rl.is_blocked("1.2.3.4", now=t + 2)
+
+
+def test_rate_limiter_unblocks_after_cooldown():
+    rl = RateLimiter(max_attempts=2, window_seconds=60.0, cooldown_seconds=10.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    assert rl.is_blocked("1.2.3.4", now=t + 5)
+    assert not rl.is_blocked("1.2.3.4", now=t + 11)
+
+
+def test_rate_limiter_old_failures_age_out_of_window():
+    rl = RateLimiter(max_attempts=3, window_seconds=10.0, cooldown_seconds=30.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t + 1)
+    # window has passed - the first two failures should no longer count
+    rl.record_failure("1.2.3.4", now=t + 20)
+    assert not rl.is_blocked("1.2.3.4", now=t + 20)
+
+
+def test_rate_limiter_success_clears_history():
+    rl = RateLimiter(max_attempts=2, window_seconds=60.0, cooldown_seconds=30.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_success("1.2.3.4")
+    rl.record_failure("1.2.3.4", now=t + 1)  # would be failure #2 if history persisted
+    assert not rl.is_blocked("1.2.3.4", now=t + 1)
+
+
+def test_rate_limiter_tracks_addresses_independently():
+    rl = RateLimiter(max_attempts=2, window_seconds=60.0, cooldown_seconds=30.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("5.6.7.8", now=t)
+    assert rl.is_blocked("1.2.3.4", now=t)
+    assert not rl.is_blocked("5.6.7.8", now=t)
 
 
 if __name__ == "__main__":
