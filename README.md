@@ -3,14 +3,15 @@
 A from-scratch demonstration of an authenticated key exchange + encrypted
 channel protocol, combining the three pillars of secure communication:
 
-| Pillar         | Primitive                                        | Purpose                                    |
-| -------------- | ------------------------------------------------ | ------------------------------------------ |
-| Key exchange   | X25519 (ECDH), fresh per session                 | Establish a shared secret; forward secrecy |
-| Authentication | Ed25519 signatures over the handshake transcript | Prevent man-in-the-middle impersonation    |
-| Encryption     | AES-256-GCM with HKDF-derived directional keys   | Confidentiality + tamper detection (AEAD)  |
-| Key protection | Passphrase-encrypted identity keys at rest       | Long-term keys aren't plaintext on disk    |
-| Replay defense | Sliding-window counter bitmap                    | Tolerates reordering, rejects true replays |
-| Availability   | Per-address rate limiting on handshake attempts  | Throttles brute-force / CPU-exhaustion DoS |
+| Pillar                       | Primitive                                         | Purpose                                                               |
+| ---------------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
+| Key exchange                 | X25519 (ECDH), fresh per session                  | Establish a shared secret; forward secrecy                            |
+| Authentication               | Ed25519 signatures over the handshake transcript  | Prevent man-in-the-middle impersonation                               |
+| Encryption                   | AES-256-GCM with HKDF-derived directional keys    | Confidentiality + tamper detection (AEAD)                             |
+| Forward secrecy (in-session) | HMAC-based symmetric ratchet, one key per message | A compromised key only exposes current/future messages, not past ones |
+| Key protection               | Passphrase-encrypted identity keys at rest        | Long-term keys aren't plaintext on disk                               |
+| Replay defense               | Sliding-window counter bitmap                     | Tolerates reordering, rejects true replays                            |
+| Availability                 | Per-address rate limiting on handshake attempts   | Throttles brute-force / CPU-exhaustion DoS                            |
 
 It is modeled loosely on the handshake patterns used by real protocols
 like Signal and Noise, simplified for clarity.
@@ -23,11 +24,23 @@ you confidentiality, and encryption alone (without integrity) can be
 silently tampered with. This project wires them together correctly and
 demonstrates _why_ each piece matters with concrete attack tests.
 
-**Forward secrecy**: identity keys (Ed25519) are long-term and only ever
-used to _sign_, never to encrypt. The actual encryption keys are derived
-from fresh, ephemeral X25519 keypairs generated new for every handshake.
-If a long-term identity key leaks later, past session traffic still
-cannot be decrypted.
+**Forward secrecy (between sessions)**: identity keys (Ed25519) are
+long-term and only ever used to _sign_, never to encrypt. The actual
+encryption keys are derived from fresh, ephemeral X25519 keypairs
+generated new for every handshake. If a long-term identity key leaks
+later, past sessions still cannot be decrypted.
+
+**Forward secrecy (within a session)**: each direction's initial
+session key is fed into a symmetric ratchet (`ratchet.py`) that derives
+a fresh AES-256-GCM key per message via HMAC-SHA256 chain-stepping, the
+same technique used in the "chain key" half of Signal's Double Ratchet.
+Because each step is one-way, capturing the ratchet's current state -
+a memory dump, a debugger attached mid-session - exposes only the
+current and future messages, not earlier ones in the same session. (A
+full Double Ratchet also re-runs Diffie-Hellman periodically for
+post-compromise "healing", so a compromise doesn't expose _future_
+messages either; this project doesn't implement that DH half - see
+"What this is not" below.)
 
 **MITM resistance**: both parties sign a transcript that includes _both_
 ephemeral public keys, not just their own. This binds the signature to
@@ -41,18 +54,15 @@ chain-of-trust is a different, larger project; the `Identity.fingerprint`
 property exists here so pins could be verified out-of-band (e.g., read
 aloud on a call) exactly like Signal safety numbers.
 
-**Anti-replay / anti-tamper**: each direction has an independent AES-GCM
-key and a strictly-increasing message counter used as both nonce and
-authenticated associated data (AAD). Replayed, reordered, or bit-flipped
-messages are all rejected — proven by automated tests.
-
-**Anti-replay / anti-tamper**: each direction has an independent AES-GCM
-key and a message counter used as both nonce and authenticated
-associated data (AAD). The receiver uses a sliding-window bitmap (the
-same approach IPsec/DTLS use): any counter within the last 1024 slots
-that hasn't been seen before is accepted, even out of order, but a true
-duplicate or a counter older than the window is rejected. This tolerates
-ordinary network reordering without weakening replay protection.
+**Anti-replay / anti-tamper**: each direction has an independent counter
+used as both nonce and authenticated associated data (AAD) for that
+message's ratchet-derived key. The receiver uses a sliding-window bitmap
+(the same approach IPsec/DTLS use): any counter within the last 1024
+slots that hasn't been seen before is accepted, even out of order, but a
+true duplicate or a counter older than the window is rejected. The
+ratchet's own skipped-key cache (bounded, to prevent a large-counter-jump
+DoS) is what makes deriving the correct key for a reordered message
+possible in the first place.
 
 **Key protection at rest**: long-term Ed25519 identity keys can be saved
 with a passphrase (PKCS8 password-based encryption). Losing an unencrypted
@@ -77,12 +87,13 @@ crypto_utils.py       Low-level primitives: X25519, Ed25519, HKDF, AES-GCM
 identity.py            Long-term identity keys + TrustStore (TOFU pinning)
                         Supports passphrase-encrypted keys at rest
 handshake.py           The 3-message authenticated key exchange protocol
-secure_channel.py      Encrypted channel w/ sliding-window replay protection
+ratchet.py              Symmetric per-message key ratchet (in-session forward secrecy)
+secure_channel.py      Encrypted channel: ratchet + sliding-window replay protection
 rate_limiter.py        Per-address handshake attempt throttling
 transport.py           TCP length-prefixed message framing (plumbing only)
 server.py / client.py  Runnable two-party encrypted chat demo (terminal)
 gui.py                 Tkinter GUI - either side (Host or Connect) in one app
-test_secure_comms.py   Automated tests incl. tampering/replay/impersonation attacks
+test_secure_comms.py   Automated tests incl. tampering/replay/impersonation/ratchet
 ```
 
 `gui.py` is a presentation layer only - it imports the exact same crypto
@@ -103,6 +114,12 @@ rejection, forged signature rejection (impersonation), unpinned-identity
 rejection, forward secrecy (fresh keys per session), encrypted-identity
 save/load round-tripping, wrong/missing passphrase rejection, and rate
 limiter blocking/cooldown/window-expiry/per-address isolation.
+
+7 further tests cover the ratchet specifically: sequential key
+derivation, out-of-order delivery via the skipped-key cache, rejection
+of a counter reused after its key was already consumed, the MAX_SKIP
+DoS bound, and an end-to-end SecureChannel integration check - 26 tests
+in total.
 
 ## Running the live demo
 
@@ -152,12 +169,17 @@ dialog rather than crashing the app.
 
 - Not a full PKI (see: mini-CA + certificate validation as a separate
   project idea) — no certificate chains, no revocation.
-- Not hardened for production: no session re-keying / ratcheting (the
-  session key is fixed for the whole conversation, unlike Signal's
-  Double Ratchet), no protection against traffic analysis, and the rate
-  limiter is in-memory/per-process so it resets on restart and doesn't
-  help if an attacker can rotate source addresses.
+- Not hardened for production: the ratchet is symmetric-only (no
+  Diffie-Hellman ratchet step), so it gives forward secrecy but not
+  post-compromise "healing" - a compromised chain state still exposes
+  all _future_ messages in that session, only past ones are protected.
+  There's also no protection against traffic analysis (message lengths
+  aren't padded), and the rate limiter is in-memory/per-process so it
+  resets on restart and doesn't help if an attacker can rotate source
+  addresses.
 - No reconnect/resumption - a dropped TCP connection ends the session
-  and requires a fresh handshake.
+  and requires a fresh handshake (which does start an entirely new,
+  uncompromised ratchet chain, since it derives from a new ephemeral
+  X25519 exchange).
 - Encrypting the identity key at rest protects against a stolen disk,
   not against malware running as the same user while the app is open.

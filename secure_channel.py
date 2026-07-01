@@ -1,9 +1,15 @@
 """
 secure_channel.py
 ------------------
-Post-handshake encrypted channel. Wraps two independent AES-256-GCM keys
-(one per direction) with monotonically-assigned message counters and a
-sliding-window anti-replay filter.
+Post-handshake encrypted channel. Wraps two independent per-direction
+key ratchets (see ratchet.py) with monotonically-assigned message
+counters and a sliding-window anti-replay filter.
+
+Key derivation - each message gets its OWN AES-256-GCM key, derived by
+stepping an HMAC-based ratchet forward (ratchet.py), rather than reusing
+one fixed session key for the whole conversation. This gives forward
+secrecy within a session: compromising the current ratchet state does
+not expose earlier messages, only the current and future ones.
 
 Anti-replay / anti-reorder design:
   - Each direction has its own counter starting at 0, assigned in send
@@ -20,10 +26,17 @@ Anti-replay / anti-reorder design:
     without weakening replay protection - a strict "must equal the next
     expected counter" scheme would treat ordinary reordering as an
     attack and drop legitimate messages.
+  - The ratchet's own out-of-order handling (skipped-key cache, bounded
+    by ReceivingChain.MAX_SKIP) is what makes deriving the right key for
+    a reordered counter possible at all; the two mechanisms are
+    complementary, not redundant - the bitmap answers "have I seen this
+    counter before", the ratchet answers "what key does this counter
+    decrypt with".
 """
 
 import crypto_utils as cu
 from cryptography.exceptions import InvalidTag
+from ratchet import ChainDesync, ReceivingChain, SendingChain
 
 
 class ReplayError(Exception):
@@ -40,9 +53,11 @@ class SecureChannel:
     def __init__(
         self, send_key: bytes, recv_key: bytes, window_size: int = DEFAULT_WINDOW_SIZE
     ):
-        self._send_key = send_key
-        self._recv_key = recv_key
-        self._send_counter = 0
+        # send_key / recv_key are the INITIAL chain keys handed off by
+        # the handshake - each is immediately consumed into a ratchet
+        # and never used directly to encrypt/decrypt a message itself.
+        self._sending_chain = SendingChain(send_key)
+        self._receiving_chain = ReceivingChain(recv_key)
         self._window_size = window_size
         self._window_mask = (1 << window_size) - 1
         # bit i of _recv_bitmap == "counter (_highest_recv_counter - i) has
@@ -51,12 +66,11 @@ class SecureChannel:
         self._recv_bitmap = 0
 
     def encrypt(self, plaintext: bytes) -> bytes:
-        nonce = cu.counter_to_nonce(self._send_counter)
-        aad = self._send_counter.to_bytes(8, "big")
-        ciphertext = cu.aes_gcm_encrypt(self._send_key, nonce, plaintext, aad)
-        framed = aad + ciphertext
-        self._send_counter += 1
-        return framed
+        counter, message_key = self._sending_chain.next()
+        nonce = cu.counter_to_nonce(counter)
+        aad = counter.to_bytes(8, "big")
+        ciphertext = cu.aes_gcm_encrypt(message_key, nonce, plaintext, aad)
+        return aad + ciphertext
 
     def decrypt(self, framed: bytes) -> bytes:
         if len(framed) < 8:
@@ -65,18 +79,23 @@ class SecureChannel:
         counter = int.from_bytes(framed[:8], "big")
         ciphertext = framed[8:]
 
-        # Check freshness BEFORE spending CPU on authentication, and
-        # before mutating any state - a forged packet with a stale or
-        # duplicate counter should be rejected cheaply, and a forged
-        # packet with a fresh-looking counter must not be allowed to
-        # "burn" that counter in the window (which could let an attacker
-        # pre-empt and block a legitimate future message).
+        # Check freshness BEFORE spending CPU on ratchet stepping or
+        # authentication, and before mutating any state - a forged
+        # packet with a stale or duplicate counter should be rejected
+        # cheaply, and a forged packet with a fresh-looking counter must
+        # not be allowed to "burn" that counter (which could let an
+        # attacker pre-empt and block a legitimate future message).
         self._check_freshness(counter)
+
+        try:
+            message_key = self._receiving_chain.key_for(counter)
+        except ChainDesync as e:
+            raise TamperError(str(e))
 
         nonce = cu.counter_to_nonce(counter)
         aad = framed[:8]
         try:
-            plaintext = cu.aes_gcm_decrypt(self._recv_key, nonce, ciphertext, aad)
+            plaintext = cu.aes_gcm_decrypt(message_key, nonce, ciphertext, aad)
         except InvalidTag:
             raise TamperError(
                 "GCM authentication tag mismatch - ciphertext was tampered "
