@@ -17,11 +17,22 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 
+from audit_log import EventCode, security_logger
 from crypto_utils import (
     generate_ed25519_keypair,
     ed25519_public_bytes,
     ed25519_public_from_bytes,
 )
+
+
+def _fingerprint(raw_public_bytes: bytes) -> str:
+    """Short human-verifiable fingerprint (like an SSH key fingerprint) for
+    a raw public key. Shared by Identity.fingerprint and TrustStore's audit
+    logging so both produce the same format for the same key."""
+    import hashlib
+
+    digest = hashlib.sha256(raw_public_bytes).hexdigest()
+    return ":".join(digest[i : i + 4] for i in range(0, 16, 4))
 
 
 class Identity:
@@ -42,10 +53,7 @@ class Identity:
     def fingerprint(self) -> str:
         """Short human-verifiable fingerprint (like an SSH key fingerprint),
         useful for out-of-band verification to defeat MITM at first contact."""
-        import hashlib
-
-        digest = hashlib.sha256(self.public_bytes).hexdigest()
-        return ":".join(digest[i : i + 4] for i in range(0, 16, 4))
+        return _fingerprint(self.public_bytes)
 
     def save(self, directory: str, passphrase: str = None):
         """Persist the private key to disk (PEM). If `passphrase` is
@@ -110,7 +118,33 @@ class TrustStore:
         self._trusted = {}  # name -> raw public key bytes
 
     def pin(self, name: str, public_bytes: bytes):
-        self._trusted[name] = public_bytes
+        existing = self._trusted.get(name)
+        if existing is None:
+            self._trusted[name] = public_bytes
+            security_logger.security(
+                EventCode.IDENTITY_PINNED,
+                "new identity pinned",
+                peer_name=name,
+                fingerprint=_fingerprint(public_bytes),
+            )
+        elif existing != public_bytes:
+            # The peer's key for this name has changed since it was last
+            # pinned - this is the TOFU equivalent of SSH's "REMOTE HOST
+            # IDENTIFICATION HAS CHANGED" warning. It can be a legitimate
+            # device change / re-install, but it's also exactly what an
+            # active attacker impersonating an already-trusted name would
+            # produce, so it's logged distinctly from a first-time pin
+            # rather than silently overwritten.
+            security_logger.security(
+                EventCode.IDENTITY_MISMATCH,
+                "pinned identity changed for an existing name",
+                peer_name=name,
+                old_fingerprint=_fingerprint(existing),
+                new_fingerprint=_fingerprint(public_bytes),
+            )
+            self._trusted[name] = public_bytes
+        # else: re-pinning the same key that's already pinned - a no-op,
+        # not worth logging.
 
     def get(self, name: str):
         raw = self._trusted.get(name)
