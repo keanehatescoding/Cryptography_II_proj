@@ -24,7 +24,7 @@ from handshake import (
     HandshakeError,
     HandshakeMessage2,
 )
-from secure_channel import ReplayError, TamperError
+from secure_channel import ReplayError, SecureChannel, TamperError
 
 
 def do_handshake(
@@ -204,7 +204,15 @@ import tempfile
 import shutil
 
 from rate_limiter import RateLimiter
-from ratchet import ChainDesync, ReceivingChain, SendingChain, kdf_chain_step
+import crypto_utils as cu
+import padding
+from ratchet import (
+    ChainDesync,
+    ReceivingChain,
+    SendingChain,
+    dh_ratchet_step,
+    kdf_chain_step,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -291,8 +299,8 @@ def test_secure_channel_uses_ratchet_end_to_end():
 
     # The receiving chain must have advanced through all 3 counters in
     # order, with nothing left in its skipped-key cache.
-    assert bob_channel._receiving_chain._next_counter == 3
-    assert bob_channel._receiving_chain._skipped == {}
+    assert bob_channel._recv_chains[0]._next_counter == 3
+    assert bob_channel._recv_chains[0]._skipped == {}
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +406,177 @@ def test_rate_limiter_tracks_addresses_independently():
     rl.record_failure("5.6.7.8", now=t)
     assert rl.is_blocked("1.2.3.4", now=t)
     assert not rl.is_blocked("5.6.7.8", now=t)
+
+
+def test_dh_ratchet_step_deterministic_and_distinct():
+    root = b"\x10" * 32
+    dh_output_a = b"\x20" * 32
+    dh_output_b = b"\x21" * 32
+
+    root_a1, chain_a1 = dh_ratchet_step(root, dh_output_a)
+    root_a2, chain_a2 = dh_ratchet_step(root, dh_output_a)
+    assert (root_a1, chain_a1) == (root_a2, chain_a2)  # deterministic given same inputs
+
+    root_b, chain_b = dh_ratchet_step(root, dh_output_b)
+    assert root_a1 != root_b
+    assert chain_a1 != chain_b
+
+
+def test_channel_performs_periodic_dh_rekey_and_peer_tracks_it():
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    alice_channel._rekey_interval = 3
+
+    initial_alice_ratchet_pub = alice_channel._my_ratchet_pub_bytes
+    initial_bob_root = bob_channel._root_key
+
+    for i in range(5):
+        ct = alice_channel.encrypt(f"msg{i}".encode())
+        assert bob_channel.decrypt(ct) == f"msg{i}".encode()
+
+    # a rekey must have happened by the 3rd of 5 messages
+    assert alice_channel._my_ratchet_pub_bytes != initial_alice_ratchet_pub
+    # bob must have picked up alice's new ratchet public key
+    assert bob_channel._peer_ratchet_pub_bytes == alice_channel._my_ratchet_pub_bytes
+    # and bob's root key must have advanced in lockstep
+    assert bob_channel._root_key != initial_bob_root
+    assert bob_channel._root_key == alice_channel._root_key
+
+
+def test_channel_functions_normally_in_both_directions_across_a_rekey():
+    """After alice rekeys mid-conversation, bob must still be able to
+    both receive from alice AND reply back to her normally."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    alice_channel._rekey_interval = 2
+
+    for i in range(4):
+        ct = alice_channel.encrypt(f"a{i}".encode())
+        assert bob_channel.decrypt(ct) == f"a{i}".encode()
+
+    ct = bob_channel.encrypt(b"reply from bob")
+    assert alice_channel.decrypt(ct) == b"reply from bob"
+
+
+def test_post_compromise_healing_new_chain_not_derivable_from_leaked_old_state():
+    """The whole point of the DH ratchet: even a full compromise of the
+    OLD root/ratchet-private-key state cannot be used to derive the key
+    for messages sent AFTER the next rekey, because that requires a DH
+    output involving a private key generated after the compromise - one
+    the attacker never had access to."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, _bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+
+    # "Attacker" captures alice's full ratchet state before any rekey.
+    leaked_root = alice_channel._root_key
+    leaked_ratchet_priv = alice_channel._my_ratchet_priv
+    peer_pub_at_compromise = alice_channel._peer_ratchet_pub_bytes
+
+    alice_channel._perform_send_ratchet_step()  # same thing encrypt() does periodically
+    real_new_chain_key = alice_channel._sending_chain._chain_key
+
+    # Attacker's best attempt: they have the leaked root, the leaked old
+    # private key, and the (unchanged) peer public key - everything
+    # EXCEPT alice's freshly-generated new private key, which was
+    # generated after the compromise and never left her process.
+    peer_pub_obj = cu.x25519_public_from_bytes(peer_pub_at_compromise)
+    attacker_dh_output = cu.derive_shared_secret(leaked_ratchet_priv, peer_pub_obj)
+    _, attacker_guess = dh_ratchet_step(leaked_root, attacker_dh_output)
+
+    assert attacker_guess != real_new_chain_key
+
+
+def test_tampering_with_rekey_flag_is_detected():
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+
+    ct = bytearray(alice_channel.encrypt(b"a message long enough to test tampering"))
+    ct[0] = SecureChannel.FLAG_REKEY  # falsely claim a rekey key is attached
+    with pytest.raises(TamperError):
+        bob_channel.decrypt(bytes(ct))
+
+
+def test_truncated_rekey_header_is_rejected():
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    alice_channel._rekey_interval = 1
+
+    ct = alice_channel.encrypt(b"triggers a rekey")
+    truncated = ct[:10]  # cut off partway through the attached pubkey
+    with pytest.raises(TamperError):
+        bob_channel.decrypt(truncated)
+
+
+def test_padding_round_trips_for_various_sizes():
+    for size in (0, 1, 5, 31, 32, 33, 100, 1000, 8192, 8193, 20000):
+        original = bytes(range(256)) * (size // 256 + 1)
+        original = original[:size]
+        assert padding.unpad(padding.pad(original)) == original
+
+
+def test_padding_output_size_is_always_a_known_bucket():
+    for size in (0, 1, 31, 32, 33, 127, 4096, 4097, 8192, 8193, 16400):
+        padded = padding.pad(b"x" * size)
+        framed_size = padding.LENGTH_PREFIX_SIZE + size
+        if framed_size <= padding.BUCKETS[-1]:
+            assert len(padded) in padding.BUCKETS
+        else:
+            # beyond the largest bucket, padded size must be an exact
+            # multiple of it
+            assert len(padded) % padding.BUCKETS[-1] == 0
+
+
+def test_padding_hides_length_differences_within_the_same_bucket():
+    """The actual privacy property: two plaintexts of very different
+    length, as long as they land in the same bucket, produce padded
+    output of IDENTICAL size."""
+    a = padding.pad(b"x" * 10)
+    b = padding.pad(b"x" * 25)
+    assert len(a) == len(b) == 32
+
+
+def test_padding_rejects_corrupted_length_prefix():
+    padded = bytearray(padding.pad(b"hello"))
+    # claim an original length far larger than the actual padded buffer
+    padded[0:4] = (999999).to_bytes(4, "big")
+    with pytest.raises(padding.PaddingError):
+        padding.unpad(bytes(padded))
+
+
+def test_padding_rejects_too_short_input():
+    with pytest.raises(padding.PaddingError):
+        padding.unpad(b"ab")  # shorter than the 4-byte length prefix
+
+
+def test_secure_channel_ciphertext_length_hides_plaintext_length():
+    """Integration check: two different-length plaintexts within the
+    same padding bucket produce equal-length ciphertexts over the real
+    encrypted channel, not just in the padding module in isolation."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+
+    ct_short = alice_channel.encrypt(b"hi")
+    ct_medium = alice_channel.encrypt(b"a shortish message")  # both < 32-byte bucket
+    assert len(ct_short) == len(ct_medium)
+
+    assert bob_channel.decrypt(ct_short) == b"hi"
+    assert bob_channel.decrypt(ct_medium) == b"a shortish message"
+
+
+def test_secure_channel_padding_can_be_disabled():
+    """Escape hatch for callers who explicitly don't want padding
+    overhead (e.g. already-bulky file transfer where padding waste
+    would matter more than length secrecy)."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    alice_channel._pad_messages = False
+    bob_channel._pad_messages = False
+
+    ct_short = alice_channel.encrypt(b"hi")
+    ct_long = alice_channel.encrypt(b"a fairly different length message")
+    assert len(ct_short) != len(ct_long)
+    assert bob_channel.decrypt(ct_short) == b"hi"
+    assert bob_channel.decrypt(ct_long) == b"a fairly different length message"
 
 
 if __name__ == "__main__":

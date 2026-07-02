@@ -103,21 +103,38 @@ def _transcript(epk_initiator: bytes, epk_responder: bytes) -> bytes:
 
 
 def _derive_channel(
-    shared_secret: bytes, epk_initiator: bytes, epk_responder: bytes, is_initiator: bool
+    shared_secret: bytes,
+    epk_initiator: bytes,
+    epk_responder: bytes,
+    is_initiator: bool,
+    my_ratchet_priv,
+    peer_ratchet_pub_bytes: bytes,
 ) -> SecureChannel:
-    """Derive two independent directional keys from the shared secret.
-    Salt binds the derivation to this specific handshake's ephemeral keys
-    so that even if (hypothetically) the same shared secret ever recurred,
-    the derived keys would still differ."""
+    """Derive two independent directional chain keys plus a root key from
+    the shared secret. Salt binds the derivation to this specific
+    handshake's ephemeral keys so that even if (hypothetically) the same
+    shared secret ever recurred, the derived keys would still differ.
+
+    The DH ratchet (see ratchet.py / secure_channel.py) is bootstrapped
+    directly from this handshake's own ephemeral X25519 keypair and the
+    peer's ephemeral public key - no extra wire messages are needed:
+    both parties already have everything required to start ratcheting
+    the moment the handshake completes."""
     salt = epk_initiator + epk_responder
 
     key_i2r = cu.hkdf(shared_secret, salt, b"initiator-to-responder", 32)
     key_r2i = cu.hkdf(shared_secret, salt, b"responder-to-initiator", 32)
+    root_key = cu.hkdf(shared_secret, salt, b"root-key", 32)
 
-    if is_initiator:
-        return SecureChannel(send_key=key_i2r, recv_key=key_r2i)
-    else:
-        return SecureChannel(send_key=key_r2i, recv_key=key_i2r)
+    send_key, recv_key = (key_i2r, key_r2i) if is_initiator else (key_r2i, key_i2r)
+
+    return SecureChannel(
+        send_key=send_key,
+        recv_key=recv_key,
+        root_key=root_key,
+        my_ratchet_priv=my_ratchet_priv,
+        peer_ratchet_pub_bytes=peer_ratchet_pub_bytes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +176,12 @@ def initiator_finish(
         state["eph_priv"], cu.x25519_public_from_bytes(msg2.ephemeral_pub)
     )
     channel = _derive_channel(
-        shared_secret, state["epk_bytes"], msg2.ephemeral_pub, is_initiator=True
+        shared_secret,
+        state["epk_bytes"],
+        msg2.ephemeral_pub,
+        is_initiator=True,
+        my_ratchet_priv=state["eph_priv"],
+        peer_ratchet_pub_bytes=msg2.ephemeral_pub,
     )
     return msg3, channel
 
@@ -211,6 +233,11 @@ def responder_finish(
         state["eph_priv"], cu.x25519_public_from_bytes(state["peer_epk_bytes"])
     )
     channel = _derive_channel(
-        shared_secret, state["peer_epk_bytes"], state["epk_bytes"], is_initiator=False
+        shared_secret,
+        state["peer_epk_bytes"],
+        state["epk_bytes"],
+        is_initiator=False,
+        my_ratchet_priv=state["eph_priv"],
+        peer_ratchet_pub_bytes=state["peer_epk_bytes"],
     )
     return channel

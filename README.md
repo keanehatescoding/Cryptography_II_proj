@@ -3,15 +3,17 @@
 A from-scratch demonstration of an authenticated key exchange + encrypted
 channel protocol, combining the three pillars of secure communication:
 
-| Pillar                       | Primitive                                         | Purpose                                                               |
-| ---------------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
-| Key exchange                 | X25519 (ECDH), fresh per session                  | Establish a shared secret; forward secrecy                            |
-| Authentication               | Ed25519 signatures over the handshake transcript  | Prevent man-in-the-middle impersonation                               |
-| Encryption                   | AES-256-GCM with HKDF-derived directional keys    | Confidentiality + tamper detection (AEAD)                             |
-| Forward secrecy (in-session) | HMAC-based symmetric ratchet, one key per message | A compromised key only exposes current/future messages, not past ones |
-| Key protection               | Passphrase-encrypted identity keys at rest        | Long-term keys aren't plaintext on disk                               |
-| Replay defense               | Sliding-window counter bitmap                     | Tolerates reordering, rejects true replays                            |
-| Availability                 | Per-address rate limiting on handshake attempts   | Throttles brute-force / CPU-exhaustion DoS                            |
+| Pillar                      | Primitive                                                   | Purpose                                                                   |
+| --------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Key exchange                | X25519 (ECDH), fresh per session                            | Establish a shared secret; forward secrecy                                |
+| Authentication              | Ed25519 signatures over the handshake transcript            | Prevent man-in-the-middle impersonation                                   |
+| Encryption                  | AES-256-GCM with HKDF-derived directional keys              | Confidentiality + tamper detection (AEAD)                                 |
+| Forward secrecy (in-epoch)  | HMAC-based symmetric ratchet, one key per message           | A compromised key only exposes current/future messages, not past ones     |
+| Post-compromise healing     | Periodic DH ratchet (fresh X25519 keypair every N messages) | A compromised state stops mattering once the next rekey happens           |
+| Traffic analysis resistance | Fixed-size padding buckets before encryption                | Ciphertext length reveals only a size range, not the exact message length |
+| Key protection              | Passphrase-encrypted identity keys at rest                  | Long-term keys aren't plaintext on disk                                   |
+| Replay defense              | Sliding-window counter bitmap                               | Tolerates reordering, rejects true replays                                |
+| Availability                | Per-address rate limiting on handshake attempts             | Throttles brute-force / CPU-exhaustion DoS                                |
 
 It is modeled loosely on the handshake patterns used by real protocols
 like Signal and Noise, simplified for clarity.
@@ -30,17 +32,49 @@ encryption keys are derived from fresh, ephemeral X25519 keypairs
 generated new for every handshake. If a long-term identity key leaks
 later, past sessions still cannot be decrypted.
 
-**Forward secrecy (within a session)**: each direction's initial
-session key is fed into a symmetric ratchet (`ratchet.py`) that derives
-a fresh AES-256-GCM key per message via HMAC-SHA256 chain-stepping, the
-same technique used in the "chain key" half of Signal's Double Ratchet.
-Because each step is one-way, capturing the ratchet's current state -
-a memory dump, a debugger attached mid-session - exposes only the
-current and future messages, not earlier ones in the same session. (A
-full Double Ratchet also re-runs Diffie-Hellman periodically for
-post-compromise "healing", so a compromise doesn't expose _future_
-messages either; this project doesn't implement that DH half - see
-"What this is not" below.)
+**Forward secrecy (within an epoch)**: each direction's chain key is fed
+into a symmetric ratchet (`ratchet.py`) that derives a fresh AES-256-GCM
+key per message via HMAC-SHA256 chain-stepping, the same technique used
+in the "chain key" half of Signal's Double Ratchet. Because each step is
+one-way, capturing the ratchet's current state - a memory dump, a
+debugger attached mid-session - exposes only the current and future
+messages, not earlier ones in the same epoch.
+
+**Post-compromise healing (across epochs)**: every `REKEY_INTERVAL`
+messages (20 by default), a party generates a brand-new X25519 keypair,
+performs a fresh Diffie-Hellman exchange with the peer's most recent
+ratchet public key, and mixes the result into the root key to start a
+new epoch with a new chain key (`ratchet.py: dh_ratchet_step`). Because
+that new private key didn't exist yet at the time of any earlier
+compromise, an attacker who captured the _old_ state cannot derive keys
+for the _new_ epoch - even full knowledge of the old root key and old
+ratchet private key isn't enough (proven in
+`test_post_compromise_healing_new_chain_not_derivable_from_leaked_old_state`).
+This closes the gap the symmetric ratchet alone leaves open: forward
+secrecy protects the past, the DH ratchet protects the future.
+
+Signal's Double Ratchet triggers this DH step _reactively_, on the first
+message of a new "sending turn" - that works because their X3DH
+handshake leaves the initiator with no sending chain at first, giving a
+natural trigger. Our handshake derives both directions' chains
+symmetrically, so that trigger doesn't exist here; the DH ratchet fires
+_periodically_ by message count instead (similar in spirit to how
+WireGuard rekeys on a message-count/time basis). Both approaches deliver
+the same healing property, just on a different schedule - see
+`ratchet.py` for the full reasoning.
+
+**Traffic analysis resistance**: `padding.py` pads every plaintext up to
+the smallest of a fixed set of size buckets (32, 64, 128, ... 8192
+bytes, then multiples of 8192 beyond that) before encryption. AES-GCM,
+like any AEAD, does not hide plaintext length on its own - ciphertext
+length is always plaintext length plus a fixed tag - so without this,
+an eavesdropper who can't read message contents could still often infer
+a lot from lengths alone (e.g. telling a short "yes" apart from a longer
+reply). Padding is on by default and can be disabled per-channel for
+callers who'd rather avoid the overhead (e.g. bulk file transfer, where
+padding waste matters more than length secrecy). This hides individual
+message _length_ only - not how many messages are sent or their timing;
+a complete traffic-analysis defense would need cover traffic too.
 
 **MITM resistance**: both parties sign a transcript that includes _both_
 ephemeral public keys, not just their own. This binds the signature to
@@ -56,13 +90,15 @@ aloud on a call) exactly like Signal safety numbers.
 
 **Anti-replay / anti-tamper**: each direction has an independent counter
 used as both nonce and authenticated associated data (AAD) for that
-message's ratchet-derived key. The receiver uses a sliding-window bitmap
-(the same approach IPsec/DTLS use): any counter within the last 1024
-slots that hasn't been seen before is accepted, even out of order, but a
-true duplicate or a counter older than the window is rejected. The
-ratchet's own skipped-key cache (bounded, to prevent a large-counter-jump
-DoS) is what makes deriving the correct key for a reordered message
-possible in the first place.
+message's ratchet-derived key - along with the epoch's rekey flag/pubkey
+when one is attached, so tampering with whether a rekey announcement is
+present is caught by GCM authentication too. The receiver uses a
+sliding-window bitmap (the same approach IPsec/DTLS use): any counter
+within the last 1024 slots that hasn't been seen before is accepted, even
+out of order, but a true duplicate or a counter older than the window is
+rejected. The ratchet's own skipped-key cache (bounded, to prevent a
+large-counter-jump DoS) is what makes deriving the correct key for a
+reordered message possible in the first place.
 
 **Key protection at rest**: long-term Ed25519 identity keys can be saved
 with a passphrase (PKCS8 password-based encryption). Losing an unencrypted
@@ -87,8 +123,9 @@ crypto_utils.py       Low-level primitives: X25519, Ed25519, HKDF, AES-GCM
 identity.py            Long-term identity keys + TrustStore (TOFU pinning)
                         Supports passphrase-encrypted keys at rest
 handshake.py           The 3-message authenticated key exchange protocol
-ratchet.py              Symmetric per-message key ratchet (in-session forward secrecy)
-secure_channel.py      Encrypted channel: ratchet + sliding-window replay protection
+ratchet.py              Symmetric per-message ratchet + periodic DH ratchet (healing)
+padding.py              Fixed-bucket plaintext padding (hides message length)
+secure_channel.py      Encrypted channel: ratchets + padding + sliding-window replay
 rate_limiter.py        Per-address handshake attempt throttling
 transport.py           TCP length-prefixed message framing (plumbing only)
 server.py / client.py  Runnable two-party encrypted chat demo (terminal)
@@ -115,11 +152,30 @@ rejection, forward secrecy (fresh keys per session), encrypted-identity
 save/load round-tripping, wrong/missing passphrase rejection, and rate
 limiter blocking/cooldown/window-expiry/per-address isolation.
 
-7 further tests cover the ratchet specifically: sequential key
-derivation, out-of-order delivery via the skipped-key cache, rejection
-of a counter reused after its key was already consumed, the MAX_SKIP
-DoS bound, and an end-to-end SecureChannel integration check - 26 tests
-in total.
+7 further tests cover the symmetric ratchet: sequential key derivation,
+out-of-order delivery via the skipped-key cache, rejection of a counter
+reused after its key was already consumed, the MAX_SKIP DoS bound, and
+an end-to-end SecureChannel integration check.
+
+6 more cover the DH ratchet: deterministic root-key mixing, a real
+periodic rekey with the peer correctly tracking the new epoch, normal
+bidirectional messaging across a rekey boundary, header tampering
+detection, a truncated-header rejection, and - the key property -
+`test_post_compromise_healing_new_chain_not_derivable_from_leaked_old_state`,
+which mathematically demonstrates that even a full leak of the old root
+key and old ratchet private key cannot reproduce the new epoch's chain
+key.
+
+32 tests in total.
+
+6 more cover padding: round-tripping across a wide range of sizes,
+output always landing on a known bucket boundary (or exact multiple of
+the largest bucket beyond it), the actual privacy property (very
+different plaintext lengths within the same bucket producing identical
+padded/ciphertext size - checked both in the padding module directly
+and through a real SecureChannel), corrupted-length-prefix rejection,
+too-short-input rejection, and the opt-out path for callers who disable
+padding. 39 tests in total.
 
 ## Running the live demo
 
@@ -169,14 +225,22 @@ dialog rather than crashing the app.
 
 - Not a full PKI (see: mini-CA + certificate validation as a separate
   project idea) — no certificate chains, no revocation.
-- Not hardened for production: the ratchet is symmetric-only (no
-  Diffie-Hellman ratchet step), so it gives forward secrecy but not
-  post-compromise "healing" - a compromised chain state still exposes
-  all _future_ messages in that session, only past ones are protected.
-  There's also no protection against traffic analysis (message lengths
-  aren't padded), and the rate limiter is in-memory/per-process so it
-  resets on restart and doesn't help if an attacker can rotate source
-  addresses.
+- Not hardened for production: rekeying is on a fixed message-count
+  schedule rather than Signal's per-turn reactive trigger (see
+  `ratchet.py` for why), which means an attacker who compromises state
+  right after a rekey still has a window of up to `REKEY_INTERVAL`
+  messages before the next one heals it - shortening the interval trades
+  performance for a smaller window. Padding hides individual message
+  length but not the number of messages sent or their timing - a
+  determined observer can still build a traffic profile from _when_ and
+  _how often_ messages flow, even with every message the same size. The
+  rate limiter is also in-memory/per-process, so it resets on restart
+  and doesn't help if an attacker can rotate source addresses.
+- Only the last few epochs' receiving chains are retained
+  (`MAX_RETAINED_CHAINS`), so a message delayed across more than a
+  couple of rekey boundaries will fail to decrypt with a clear error
+  rather than silently succeeding - a deliberate bounded-memory
+  trade-off, not a bug.
 - No reconnect/resumption - a dropped TCP connection ends the session
   and requires a fresh handshake (which does start an entirely new,
   uncompromised ratchet chain, since it derives from a new ephemeral
