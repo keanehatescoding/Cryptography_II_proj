@@ -75,6 +75,10 @@ class EventCode(str, Enum):
     # Rate limiting
     RATE_LIMIT_TRIGGERED = "rate_limit_triggered"
 
+    # Transport / framing
+    FRAME_OVERSIZE_REJECTED = "frame_oversize_rejected"
+    FRAME_MALFORMED = "frame_malformed"
+
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
