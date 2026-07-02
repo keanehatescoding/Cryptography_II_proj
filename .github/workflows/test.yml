@@ -1,283 +1,30 @@
-"""
-secure_channel.py
-------------------
-Post-handshake encrypted channel combining four layers:
+name: tests
 
-  1. Symmetric ratchet (ratchet.py) - a fresh AES-256-GCM key per
-     message, giving forward secrecy within an "epoch".
-  2. DH ratchet (ratchet.py: dh_ratchet_step) - periodic re-keying via a
-     brand new Diffie-Hellman exchange, giving post-compromise healing:
-     a state compromise only exposes traffic up to the next rekey.
-  3. Length padding (padding.py) - plaintext is padded to a fixed size
-     bucket before encryption, so ciphertext length reveals only a
-     size range, not the exact message length.
-  4. Sliding-window anti-replay filter - tolerates reordering, rejects
-     true duplicates and anything older than the window.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
 
-Wire format per message:
-    [1-byte flag] [32-byte new ratchet pubkey, only if flag==1]
-    [8-byte counter] [AES-GCM ciphertext(padded plaintext)+tag]
-The bracketed flag/pubkey/counter together form the AAD, so tampering
-with whether a rekey announcement is present (e.g. stripping it, or
-splicing one onto an unrelated message) is caught by GCM authentication
-just like tampering with the counter already was.
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
 
-Epoch rekeying: rather than Signal's reactive "ratchet on the first
-message of every new sending turn" (which relies on their asymmetric
-X3DH handshake leaving the initiator with no sending chain at first -
-see ratchet.py for the full explanation of why that trigger doesn't
-apply here), a party proactively generates a new DH ratchet keypair
-every REKEY_INTERVAL messages it sends. The peer detects a new ratchet
-public key attached to an incoming message and performs the matching
-DH step to derive a new receiving chain.
+    steps:
+      - uses: actions/checkout@v4
 
-Because both a send-triggered and a receive-triggered DH step can
-introduce a new chain at any wire counter, receiving chains are kept in
-a dict keyed by the wire counter at which that chain started, so an
-incoming counter can be mapped back to "which chain (and which local
-step within it) produced this message's key". Only a bounded number of
-recent chains are retained (MAX_RETAINED_CHAINS) - a message so delayed
-that its chain has already been pruned will fail to decrypt with a
-clear error rather than silently succeeding or crashing; this is a
-deliberate, documented trade-off of bounded memory over perfect
-reliability for extremely late delivery across a rekey boundary.
-"""
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
 
-import crypto_utils as cu
-import padding
-from audit_log import EventCode, security_logger
-from cryptography.exceptions import InvalidTag
-from ratchet import ChainDesync, ReceivingChain, SendingChain, dh_ratchet_step
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-
-class ReplayError(Exception):
-    pass
-
-
-class TamperError(Exception):
-    pass
-
-
-class SecureChannel:
-    DEFAULT_WINDOW_SIZE = 1024
-    DEFAULT_REKEY_INTERVAL = 20
-    MAX_RETAINED_CHAINS = 3
-
-    FLAG_NO_REKEY = 0
-    FLAG_REKEY = 1
-
-    def __init__(
-        self,
-        send_key: bytes,
-        recv_key: bytes,
-        root_key: bytes,
-        my_ratchet_priv,
-        peer_ratchet_pub_bytes: bytes,
-        window_size: int = DEFAULT_WINDOW_SIZE,
-        rekey_interval: int = DEFAULT_REKEY_INTERVAL,
-        pad_messages: bool = True,
-    ):
-        # send_key / recv_key are the INITIAL chain keys handed off by
-        # the handshake (bootstrapped from the handshake's own ephemeral
-        # X25519 exchange, so no extra wire messages are needed to start
-        # the DH ratchet - see handshake.py's _derive_channel).
-        self._sending_chain = SendingChain(send_key)
-        self._recv_chains = {0: ReceivingChain(recv_key)}
-
-        self._root_key = root_key
-        self._my_ratchet_priv = my_ratchet_priv
-        self._my_ratchet_pub_bytes = cu.x25519_public_bytes(
-            my_ratchet_priv.public_key()
-        )
-        self._peer_ratchet_pub_bytes = peer_ratchet_pub_bytes
-
-        self._rekey_interval = rekey_interval
-        self._messages_since_rekey = 0
-        self._pad_messages = pad_messages
-
-        self._send_counter = 0
-        self._window_size = window_size
-        self._window_mask = (1 << window_size) - 1
-        # bit i of _recv_bitmap == "counter (_highest_recv_counter - i) has
-        # been seen". -1 means no messages received yet.
-        self._highest_recv_counter = -1
-        self._recv_bitmap = 0
-
-    # -- sending ------------------------------------------------------
-
-    def encrypt(self, plaintext: bytes) -> bytes:
-        if self._messages_since_rekey >= self._rekey_interval:
-            self._perform_send_ratchet_step()
-            header = bytes([self.FLAG_REKEY]) + self._my_ratchet_pub_bytes
-        else:
-            header = bytes([self.FLAG_NO_REKEY])
-
-        counter = self._send_counter
-        self._send_counter += 1
-        self._messages_since_rekey += 1
-
-        _, message_key = self._sending_chain.next()
-        nonce = cu.counter_to_nonce(counter)
-        aad = header + counter.to_bytes(8, "big")
-        payload = padding.pad(plaintext) if self._pad_messages else plaintext
-        ciphertext = cu.aes_gcm_encrypt(message_key, nonce, payload, aad)
-        return aad + ciphertext
-
-    def _perform_send_ratchet_step(self):
-        new_priv, new_pub = cu.generate_x25519_keypair()
-        peer_pub_obj = cu.x25519_public_from_bytes(self._peer_ratchet_pub_bytes)
-        dh_output = cu.derive_shared_secret(new_priv, peer_pub_obj)
-        self._root_key, new_chain_key = dh_ratchet_step(self._root_key, dh_output)
-
-        self._sending_chain = SendingChain(new_chain_key)
-        self._my_ratchet_priv = new_priv
-        self._my_ratchet_pub_bytes = cu.x25519_public_bytes(new_pub)
-        self._messages_since_rekey = 0
-        security_logger.security(
-            EventCode.REKEY_PERFORMED,
-            "sending-side DH ratchet step performed",
-            direction="send",
-            at_counter=self._send_counter,
-        )
-
-    # -- receiving ------------------------------------------------------
-
-    def decrypt(self, framed: bytes) -> bytes:
-        if len(framed) < 9:
-            raise TamperError("Frame too short to contain a valid header.")
-
-        flag = framed[0]
-        offset = 1
-        new_peer_pub_bytes = None
-        if flag == self.FLAG_REKEY:
-            if len(framed) < 1 + 32 + 8:
-                raise TamperError("Frame too short for an attached ratchet key.")
-            new_peer_pub_bytes = framed[offset : offset + 32]
-            offset += 32
-        elif flag != self.FLAG_NO_REKEY:
-            raise TamperError(f"Invalid ratchet header flag: {flag}.")
-
-        counter = int.from_bytes(framed[offset : offset + 8], "big")
-        header_len = offset + 8
-        aad = framed[:header_len]
-        ciphertext = framed[header_len:]
-
-        # Check freshness BEFORE spending CPU on ratchet stepping or
-        # authentication, and before mutating any state - a forged
-        # packet with a stale or duplicate counter should be rejected
-        # cheaply, and a forged packet with a fresh-looking counter must
-        # not be allowed to "burn" that counter (which could let an
-        # attacker pre-empt and block a legitimate future message).
-        self._check_freshness(counter)
-
-        if (
-            new_peer_pub_bytes is not None
-            and new_peer_pub_bytes != self._peer_ratchet_pub_bytes
-        ):
-            self._perform_receive_ratchet_step(new_peer_pub_bytes, counter)
-
-        chain_start = max(k for k in self._recv_chains if k <= counter)
-        chain = self._recv_chains[chain_start]
-        local_counter = counter - chain_start
-
-        try:
-            message_key = chain.key_for(local_counter)
-        except ChainDesync as e:
-            security_logger.security(
-                EventCode.CHAIN_DESYNC,
-                "receiving chain desynchronized",
-                counter=counter,
-                detail=str(e),
-            )
-            raise TamperError(str(e))
-
-        nonce = cu.counter_to_nonce(counter)
-        try:
-            payload = cu.aes_gcm_decrypt(message_key, nonce, ciphertext, aad)
-        except InvalidTag:
-            security_logger.security(
-                EventCode.TAMPER_DETECTED,
-                "GCM authentication tag mismatch",
-                counter=counter,
-            )
-            raise TamperError(
-                "GCM authentication tag mismatch - ciphertext was tampered "
-                "with, corrupted, or encrypted under the wrong key."
-            )
-
-        try:
-            plaintext = padding.unpad(payload) if self._pad_messages else payload
-        except padding.PaddingError as e:
-            security_logger.security(
-                EventCode.TAMPER_DETECTED,
-                "invalid padding after decryption",
-                counter=counter,
-                detail=str(e),
-            )
-            raise TamperError(f"Invalid padding after decryption: {e}")
-
-        self._mark_seen(counter)
-        return plaintext
-
-    def _perform_receive_ratchet_step(
-        self, new_peer_pub_bytes: bytes, start_counter: int
-    ):
-        peer_pub_obj = cu.x25519_public_from_bytes(new_peer_pub_bytes)
-        dh_output = cu.derive_shared_secret(self._my_ratchet_priv, peer_pub_obj)
-        self._root_key, new_chain_key = dh_ratchet_step(self._root_key, dh_output)
-
-        self._recv_chains[start_counter] = ReceivingChain(new_chain_key)
-        self._peer_ratchet_pub_bytes = new_peer_pub_bytes
-        self._prune_old_recv_chains()
-        security_logger.security(
-            EventCode.REKEY_PERFORMED,
-            "receiving-side DH ratchet step performed",
-            direction="recv",
-            at_counter=start_counter,
-        )
-
-    def _prune_old_recv_chains(self):
-        excess = len(self._recv_chains) - self.MAX_RETAINED_CHAINS
-        if excess > 0:
-            for key in sorted(self._recv_chains)[:excess]:
-                del self._recv_chains[key]
-
-    # -- replay window ------------------------------------------------------
-
-    def _check_freshness(self, counter: int):
-        if counter > self._highest_recv_counter:
-            return  # newer than anything seen so far - always fresh
-        distance = self._highest_recv_counter - counter
-        if distance >= self._window_size:
-            security_logger.security(
-                EventCode.REPLAY_REJECTED,
-                "counter older than replay window",
-                counter=counter,
-                highest_seen=self._highest_recv_counter,
-            )
-            raise ReplayError(
-                f"Counter {counter} is older than the replay window "
-                f"(oldest acceptable: {self._highest_recv_counter - self._window_size + 1})."
-            )
-        if self._recv_bitmap & (1 << distance):
-            security_logger.security(
-                EventCode.REPLAY_REJECTED,
-                "duplicate counter received",
-                counter=counter,
-                highest_seen=self._highest_recv_counter,
-            )
-            raise ReplayError(f"Counter {counter} has already been received (replay).")
-
-    def _mark_seen(self, counter: int):
-        if counter > self._highest_recv_counter:
-            shift = counter - self._highest_recv_counter
-            if shift >= self._window_size:
-                self._recv_bitmap = 1
-            else:
-                self._recv_bitmap = (
-                    (self._recv_bitmap << shift) | 1
-                ) & self._window_mask
-            self._highest_recv_counter = counter
-        else:
-            distance = self._highest_recv_counter - counter
-            self._recv_bitmap |= 1 << distance
+      - name: Run tests
+        run: pytest -v --tb=short
