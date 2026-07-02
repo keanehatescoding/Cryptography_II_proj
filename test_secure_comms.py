@@ -507,6 +507,49 @@ def test_truncated_rekey_header_is_rejected():
         bob_channel.decrypt(truncated)
 
 
+def test_forged_rekey_header_does_not_mutate_state_before_auth():
+    """A rekey announcement (flag + attached pubkey) is NOT authenticated
+    until the GCM tag over the whole message is checked. This test proves
+    an attacker who forges that header - claiming a bogus new ratchet
+    public key on a message that will fail authentication - cannot use it
+    to corrupt bob's real session state (root key, peer ratchet pubkey,
+    or retained receiving chains). Before the fix, `decrypt()` performed
+    the DH ratchet step and installed the resulting chain BEFORE checking
+    the GCM tag, so a forged-but-unauthenticated header could desync a
+    real session even though the forged message itself was correctly
+    rejected."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+
+    original_root_key = bob_channel._root_key
+    original_peer_pub = bob_channel._peer_ratchet_pub_bytes
+    original_recv_chain_keys = set(bob_channel._recv_chains)
+
+    # Attacker crafts a message claiming a rekey with an attacker-chosen
+    # (but validly-formed) ephemeral public key, using a fresh counter so
+    # it passes the freshness check, and garbage ciphertext that cannot
+    # possibly authenticate.
+    attacker_priv, attacker_pub = cu.generate_x25519_keypair()
+    fake_peer_pub_bytes = cu.x25519_public_bytes(attacker_pub)
+    counter = 0  # bob hasn't received anything yet - this is "fresh"
+    header = bytes([SecureChannel.FLAG_REKEY]) + fake_peer_pub_bytes
+    aad = header + counter.to_bytes(8, "big")
+    garbage_ciphertext = cu.random_bytes(32)
+    forged_frame = aad + garbage_ciphertext
+
+    with pytest.raises(TamperError):
+        bob_channel.decrypt(forged_frame)
+
+    # The forged header must have had ZERO effect on real channel state.
+    assert bob_channel._root_key == original_root_key
+    assert bob_channel._peer_ratchet_pub_bytes == original_peer_pub
+    assert set(bob_channel._recv_chains) == original_recv_chain_keys
+
+    # And a legitimate message from alice must still decrypt normally.
+    ct = alice_channel.encrypt(b"still works after the forged packet")
+    assert bob_channel.decrypt(ct) == b"still works after the forged packet"
+
+
 def test_padding_round_trips_for_various_sizes():
     for size in (0, 1, 5, 31, 32, 33, 100, 1000, 8192, 8193, 20000):
         original = bytes(range(256)) * (size // 256 + 1)
