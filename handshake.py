@@ -41,6 +41,7 @@ from dataclasses import dataclass
 
 
 import crypto_utils as cu
+from audit_log import EventCode, security_logger
 from identity import Identity, TrustStore
 from secure_channel import SecureChannel
 
@@ -157,6 +158,12 @@ def initiator_finish(
     """Step 3: verify responder's signature, derive keys, produce message 3."""
     peer_pub = trust_store.get(msg2.name)
     if peer_pub is None:
+        security_logger.security(
+            EventCode.HANDSHAKE_UNKNOWN_IDENTITY,
+            "responder identity not pinned in trust store",
+            role="initiator",
+            peer_name=msg2.name,
+        )
         raise HandshakeError(
             f"No pinned public key for '{msg2.name}' - refusing to trust "
             f"an unknown identity (possible impersonation attempt)."
@@ -164,6 +171,12 @@ def initiator_finish(
 
     transcript = _transcript(state["epk_bytes"], msg2.ephemeral_pub)
     if not cu.verify(peer_pub, msg2.signature, transcript):
+        security_logger.security(
+            EventCode.HANDSHAKE_SIG_FAIL,
+            "responder signature verification failed",
+            role="initiator",
+            peer_name=msg2.name,
+        )
         raise HandshakeError(
             f"Signature verification FAILED for '{msg2.name}' - "
             f"handshake aborted (possible MITM attack or key mismatch)."
@@ -182,6 +195,12 @@ def initiator_finish(
         is_initiator=True,
         my_ratchet_priv=state["eph_priv"],
         peer_ratchet_pub_bytes=msg2.ephemeral_pub,
+    )
+    security_logger.security(
+        EventCode.HANDSHAKE_COMPLETED,
+        "handshake completed successfully",
+        role="initiator",
+        peer_name=msg2.name,
     )
     return msg3, channel
 
@@ -217,6 +236,12 @@ def responder_finish(
     """Step 4: verify initiator's signature, derive keys."""
     peer_pub = trust_store.get(state["peer_name"])
     if peer_pub is None:
+        security_logger.security(
+            EventCode.HANDSHAKE_UNKNOWN_IDENTITY,
+            "initiator identity not pinned in trust store",
+            role="responder",
+            peer_name=state["peer_name"],
+        )
         raise HandshakeError(
             f"No pinned public key for '{state['peer_name']}' - refusing "
             f"to trust an unknown identity."
@@ -224,6 +249,12 @@ def responder_finish(
 
     transcript = _transcript(state["peer_epk_bytes"], state["epk_bytes"])
     if not cu.verify(peer_pub, msg3.signature, transcript):
+        security_logger.security(
+            EventCode.HANDSHAKE_SIG_FAIL,
+            "initiator signature verification failed",
+            role="responder",
+            peer_name=state["peer_name"],
+        )
         raise HandshakeError(
             f"Signature verification FAILED for '{state['peer_name']}' - "
             f"handshake aborted (possible MITM attack or key mismatch)."
@@ -239,5 +270,11 @@ def responder_finish(
         is_initiator=False,
         my_ratchet_priv=state["eph_priv"],
         peer_ratchet_pub_bytes=state["peer_epk_bytes"],
+    )
+    security_logger.security(
+        EventCode.HANDSHAKE_COMPLETED,
+        "handshake completed successfully",
+        role="responder",
+        peer_name=state["peer_name"],
     )
     return channel
