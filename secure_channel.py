@@ -27,9 +27,14 @@ message of every new sending turn" (which relies on their asymmetric
 X3DH handshake leaving the initiator with no sending chain at first -
 see ratchet.py for the full explanation of why that trigger doesn't
 apply here), a party proactively generates a new DH ratchet keypair
-every REKEY_INTERVAL messages it sends. The peer detects a new ratchet
-public key attached to an incoming message and performs the matching
-DH step to derive a new receiving chain.
+every REKEY_INTERVAL messages it sends, OR every REKEY_INTERVAL_SECONDS
+of wall-clock time since the last rekey, whichever comes first. The
+time trigger exists because a low-traffic session (few messages, but
+open for a long time) would otherwise never close its post-compromise-
+healing window under a pure message-count trigger - a state compromise
+early in a long idle session would stay exploitable indefinitely. The
+peer detects a new ratchet public key attached to an incoming message
+and performs the matching DH step to derive a new receiving chain.
 
 Because both a send-triggered and a receive-triggered DH step can
 introduce a new chain at any wire counter, receiving chains are kept in
@@ -42,6 +47,8 @@ clear error rather than silently succeeding or crashing; this is a
 deliberate, documented trade-off of bounded memory over perfect
 reliability for extremely late delivery across a rekey boundary.
 """
+
+import time
 
 import crypto_utils as cu
 import padding
@@ -61,6 +68,7 @@ class TamperError(Exception):
 class SecureChannel:
     DEFAULT_WINDOW_SIZE = 1024
     DEFAULT_REKEY_INTERVAL = 20
+    DEFAULT_REKEY_INTERVAL_SECONDS = 300.0  # 5 minutes
     MAX_RETAINED_CHAINS = 3
 
     FLAG_NO_REKEY = 0
@@ -75,6 +83,7 @@ class SecureChannel:
         peer_ratchet_pub_bytes: bytes,
         window_size: int = DEFAULT_WINDOW_SIZE,
         rekey_interval: int = DEFAULT_REKEY_INTERVAL,
+        rekey_interval_seconds: float = DEFAULT_REKEY_INTERVAL_SECONDS,
         pad_messages: bool = True,
     ):
         # send_key / recv_key are the INITIAL chain keys handed off by
@@ -92,7 +101,9 @@ class SecureChannel:
         self._peer_ratchet_pub_bytes = peer_ratchet_pub_bytes
 
         self._rekey_interval = rekey_interval
+        self._rekey_interval_seconds = rekey_interval_seconds
         self._messages_since_rekey = 0
+        self._last_rekey_time = time.monotonic()
         self._pad_messages = pad_messages
 
         self._send_counter = 0
@@ -106,8 +117,13 @@ class SecureChannel:
     # -- sending ------------------------------------------------------
 
     def encrypt(self, plaintext: bytes) -> bytes:
-        if self._messages_since_rekey >= self._rekey_interval:
-            self._perform_send_ratchet_step()
+        elapsed = time.monotonic() - self._last_rekey_time
+        count_due = self._messages_since_rekey >= self._rekey_interval
+        time_due = elapsed >= self._rekey_interval_seconds
+        if count_due or time_due:
+            self._perform_send_ratchet_step(
+                reason="count" if count_due else "time", elapsed=elapsed
+            )
             header = bytes([self.FLAG_REKEY]) + self._my_ratchet_pub_bytes
         else:
             header = bytes([self.FLAG_NO_REKEY])
@@ -123,7 +139,7 @@ class SecureChannel:
         ciphertext = cu.aes_gcm_encrypt(message_key, nonce, payload, aad)
         return aad + ciphertext
 
-    def _perform_send_ratchet_step(self):
+    def _perform_send_ratchet_step(self, reason: str = "count", elapsed: float = 0.0):
         new_priv, new_pub = cu.generate_x25519_keypair()
         peer_pub_obj = cu.x25519_public_from_bytes(self._peer_ratchet_pub_bytes)
         dh_output = cu.derive_shared_secret(new_priv, peer_pub_obj)
@@ -133,11 +149,14 @@ class SecureChannel:
         self._my_ratchet_priv = new_priv
         self._my_ratchet_pub_bytes = cu.x25519_public_bytes(new_pub)
         self._messages_since_rekey = 0
+        self._last_rekey_time = time.monotonic()
         security_logger.security(
             EventCode.REKEY_PERFORMED,
             "sending-side DH ratchet step performed",
             direction="send",
             at_counter=self._send_counter,
+            reason=reason,
+            seconds_since_last_rekey=round(elapsed, 1),
         )
 
     # -- receiving ------------------------------------------------------
