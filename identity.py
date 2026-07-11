@@ -25,14 +25,21 @@ from crypto_utils import (
 )
 
 
-def _fingerprint(raw_public_bytes: bytes) -> str:
+def fingerprint_for_bytes(raw_public_bytes: bytes) -> str:
     """Short human-verifiable fingerprint (like an SSH key fingerprint) for
-    a raw public key. Shared by Identity.fingerprint and TrustStore's audit
-    logging so both produce the same format for the same key."""
+    a raw public key. Shared by Identity.fingerprint, TrustStore's audit
+    logging, and every caller that needs to show a peer's claimed
+    fingerprint for out-of-band verification before pinning it - so all
+    of them produce the same format for the same key instead of each
+    re-deriving their own copy of this logic."""
     import hashlib
 
     digest = hashlib.sha256(raw_public_bytes).hexdigest()
     return ":".join(digest[i : i + 4] for i in range(0, 16, 4))
+
+
+# Backwards-compatible alias for the old private name.
+_fingerprint = fingerprint_for_bytes
 
 
 class Identity:

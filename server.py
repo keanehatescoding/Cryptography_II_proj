@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import transport
-from identity import Identity, TrustStore
+from identity import Identity, TrustStore, fingerprint_for_bytes
 from handshake import (
     HandshakeMessage1,
     HandshakeMessage3,
@@ -74,9 +74,27 @@ def handle_connection(
         peer_name = peer_intro["name"]
         peer_pubkey = bytes.fromhex(peer_intro["identity_pub"])
         if trust_store.get(peer_name) is None:
+            fp = fingerprint_for_bytes(peer_pubkey)
+            print(f"[bob] '{peer_name}' is not yet trusted.")
+            print(f"[bob] their identity fingerprint is: {fp}")
+            print(
+                f"[bob] compare this, out-of-band (in person, on a call, "
+                f"etc.), against the fingerprint '{peer_name}' sees printed "
+                f"as THEIR OWN identity before trusting it. Anyone who "
+                f"skips this step is trusting whoever is on the other end "
+                f"of the TCP connection, not necessarily '{peer_name}'."
+            )
+            answer = (
+                input(f"[bob] trust and pin this identity as '{peer_name}'? [y/N]: ")
+                .strip()
+                .lower()
+            )
+            if answer != "y":
+                print(f"[bob] declined to trust '{peer_name}'. Aborting.")
+                return
             trust_store.pin(peer_name, peer_pubkey)
             trust_store.save(f"{KEY_DIR}/bob_trust.json")
-            print(f"[bob] TOFU: pinned new identity '{peer_name}'")
+            print(f"[bob] TOFU: pinned new identity '{peer_name}' ({fp})")
         elif not trust_store.is_trusted(peer_name, peer_pubkey):
             print(
                 f"[bob] !!! WARNING: '{peer_name}' presented a DIFFERENT "

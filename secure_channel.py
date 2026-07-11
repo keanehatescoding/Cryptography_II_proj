@@ -65,6 +65,20 @@ class TamperError(Exception):
     pass
 
 
+class _PendingReceiveRatchet:
+    """A candidate receive-side DH ratchet step that has been computed
+    but not yet applied to the channel's state. Kept separate from the
+    live SecureChannel fields so that an incoming message can be fully
+    authenticated *before* any of this is committed - see decrypt()."""
+
+    __slots__ = ("root_key", "chain", "peer_pub_bytes")
+
+    def __init__(self, root_key: bytes, chain: ReceivingChain, peer_pub_bytes: bytes):
+        self.root_key = root_key
+        self.chain = chain
+        self.peer_pub_bytes = peer_pub_bytes
+
+
 class SecureChannel:
     DEFAULT_WINDOW_SIZE = 1024
     DEFAULT_REKEY_INTERVAL = 20
@@ -189,15 +203,31 @@ class SecureChannel:
         # attacker pre-empt and block a legitimate future message).
         self._check_freshness(counter)
 
+        # If this message announces a new ratchet public key, compute
+        # what the resulting root key / receiving chain *would* be, but
+        # do NOT touch self._root_key, self._recv_chains, or
+        # self._peer_ratchet_pub_bytes yet. The header (flag + pubkey +
+        # counter) is authenticated data, not authenticated on its own -
+        # until the GCM tag below actually verifies, new_peer_pub_bytes
+        # could be attacker-supplied. Applying a DH ratchet step from
+        # unauthenticated input would let anyone who can inject a single
+        # packet corrupt the root key, evict legitimate old receiving
+        # chains via pruning, and clobber _peer_ratchet_pub_bytes - all
+        # without ever producing a valid tag. So the candidate step is
+        # only committed after decryption succeeds, at the bottom of
+        # this method.
+        pending_rekey = None
         if (
             new_peer_pub_bytes is not None
             and new_peer_pub_bytes != self._peer_ratchet_pub_bytes
         ):
-            self._perform_receive_ratchet_step(new_peer_pub_bytes, counter)
-
-        chain_start = max(k for k in self._recv_chains if k <= counter)
-        chain = self._recv_chains[chain_start]
-        local_counter = counter - chain_start
+            pending_rekey = self._compute_receive_ratchet_step(new_peer_pub_bytes)
+            chain = pending_rekey.chain
+            local_counter = 0  # a rekeyed chain always starts at this counter
+        else:
+            chain_start = max(k for k in self._recv_chains if k <= counter)
+            chain = self._recv_chains[chain_start]
+            local_counter = counter - chain_start
 
         try:
             message_key = chain.key_for(local_counter)
@@ -235,18 +265,41 @@ class SecureChannel:
             )
             raise TamperError(f"Invalid padding after decryption: {e}")
 
+        # Authentication succeeded - now, and only now, is it safe to
+        # commit the ratchet step (if any) and record the counter as
+        # seen.
+        if pending_rekey is not None:
+            self._commit_receive_ratchet_step(pending_rekey, counter)
         self._mark_seen(counter)
         return plaintext
 
-    def _perform_receive_ratchet_step(
-        self, new_peer_pub_bytes: bytes, start_counter: int
-    ):
+    def _compute_receive_ratchet_step(
+        self, new_peer_pub_bytes: bytes
+    ) -> _PendingReceiveRatchet:
+        """Derive the candidate root key and receiving chain for an
+        incoming DH ratchet announcement, without mutating any channel
+        state. Safe to call speculatively on unauthenticated input,
+        since nothing here is written back to self."""
         peer_pub_obj = cu.x25519_public_from_bytes(new_peer_pub_bytes)
         dh_output = cu.derive_shared_secret(self._my_ratchet_priv, peer_pub_obj)
-        self._root_key, new_chain_key = dh_ratchet_step(self._root_key, dh_output)
+        candidate_root_key, new_chain_key = dh_ratchet_step(self._root_key, dh_output)
+        return _PendingReceiveRatchet(
+            root_key=candidate_root_key,
+            chain=ReceivingChain(new_chain_key),
+            peer_pub_bytes=new_peer_pub_bytes,
+        )
 
-        self._recv_chains[start_counter] = ReceivingChain(new_chain_key)
-        self._peer_ratchet_pub_bytes = new_peer_pub_bytes
+    def _commit_receive_ratchet_step(
+        self, pending: _PendingReceiveRatchet, start_counter: int
+    ):
+        """Apply a previously-computed candidate ratchet step. Must only
+        be called after the message that announced it has passed GCM
+        authentication (see decrypt()), so an attacker who cannot
+        produce a valid tag can never influence root key, receiving
+        chains, or the pinned peer ratchet public key."""
+        self._root_key = pending.root_key
+        self._recv_chains[start_counter] = pending.chain
+        self._peer_ratchet_pub_bytes = pending.peer_pub_bytes
         self._prune_old_recv_chains()
         security_logger.security(
             EventCode.REKEY_PERFORMED,

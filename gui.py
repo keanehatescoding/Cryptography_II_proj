@@ -15,7 +15,6 @@ Run with:
     python3 gui.py
 """
 
-import hashlib
 import queue
 import socket
 import threading
@@ -35,7 +34,7 @@ from handshake import (
     responder_finish,
     responder_respond,
 )
-from identity import Identity, TrustStore
+from identity import Identity, TrustStore, fingerprint_for_bytes
 from rate_limiter import RateLimiter
 from secure_channel import ReplayError, TamperError
 
@@ -61,11 +60,6 @@ def load_or_create_identity(name: str, passphrase: str = None) -> Identity:
         return Identity.load(name, KEY_DIR, passphrase=passphrase)
 
     return Identity.load(name, KEY_DIR)
-
-
-def fingerprint_from_bytes(raw: bytes) -> str:
-    digest = hashlib.sha256(raw).hexdigest()
-    return ":".join(digest[i : i + 4] for i in range(0, 16, 4))
 
 
 class PeerWorker(threading.Thread):
@@ -223,7 +217,7 @@ class PeerWorker(threading.Thread):
         peer_pub = bytes.fromhex(peer_intro["identity_pub"])
 
         if self.trust_store.get(peer_name) is None:
-            fp = fingerprint_from_bytes(peer_pub)
+            fp = fingerprint_for_bytes(peer_pub)
             if not self._ask_trust(peer_name, fp):
                 self.sock.close()
                 raise HandshakeError(f"Declined to trust '{peer_name}'.")
