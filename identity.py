@@ -42,6 +42,28 @@ def fingerprint_for_bytes(raw_public_bytes: bytes) -> str:
 _fingerprint = fingerprint_for_bytes
 
 
+class IdentityMismatchError(Exception):
+    """Raised by TrustStore.pin() when a name that's already pinned is
+    presented with a DIFFERENT public key. This is the TOFU equivalent
+    of SSH's "REMOTE HOST IDENTIFICATION HAS CHANGED" warning: it can be
+    a legitimate device change / re-install, but it's also exactly what
+    an active attacker impersonating an already-trusted name would
+    produce, so pin() refuses to silently accept it. A caller that has
+    verified out-of-band that the change is legitimate should call
+    TrustStore.repin() instead, which makes that override explicit."""
+
+    def __init__(self, name: str, old_fingerprint: str, new_fingerprint: str):
+        self.name = name
+        self.old_fingerprint = old_fingerprint
+        self.new_fingerprint = new_fingerprint
+        super().__init__(
+            f"'{name}' is already pinned to a different key "
+            f"(pinned: {old_fingerprint}, presented: {new_fingerprint}). "
+            f"Call TrustStore.repin() if this change has been verified "
+            f"out-of-band."
+        )
+
+
 class Identity:
     """A party's long-term signing identity."""
 
@@ -125,6 +147,12 @@ class TrustStore:
         self._trusted = {}  # name -> raw public key bytes
 
     def pin(self, name: str, public_bytes: bytes):
+        """Pin `name` to `public_bytes`. Safe to call repeatedly with the
+        same key (a no-op past the first time). Raises
+        IdentityMismatchError if `name` is already pinned to a
+        DIFFERENT key - callers must not treat that as routine and
+        silently move on; use repin() if the change has actually been
+        verified out-of-band."""
         existing = self._trusted.get(name)
         if existing is None:
             self._trusted[name] = public_bytes
@@ -135,23 +163,36 @@ class TrustStore:
                 fingerprint=_fingerprint(public_bytes),
             )
         elif existing != public_bytes:
-            # The peer's key for this name has changed since it was last
-            # pinned - this is the TOFU equivalent of SSH's "REMOTE HOST
-            # IDENTIFICATION HAS CHANGED" warning. It can be a legitimate
-            # device change / re-install, but it's also exactly what an
-            # active attacker impersonating an already-trusted name would
-            # produce, so it's logged distinctly from a first-time pin
-            # rather than silently overwritten.
+            old_fp = _fingerprint(existing)
+            new_fp = _fingerprint(public_bytes)
             security_logger.security(
                 EventCode.IDENTITY_MISMATCH,
                 "pinned identity changed for an existing name",
                 peer_name=name,
-                old_fingerprint=_fingerprint(existing),
-                new_fingerprint=_fingerprint(public_bytes),
+                old_fingerprint=old_fp,
+                new_fingerprint=new_fp,
             )
-            self._trusted[name] = public_bytes
+            raise IdentityMismatchError(name, old_fp, new_fp)
         # else: re-pinning the same key that's already pinned - a no-op,
         # not worth logging.
+
+    def repin(self, name: str, public_bytes: bytes):
+        """Explicitly overwrite an existing pin with a new key, bypassing
+        the mismatch check in pin(). Only call this after the change has
+        actually been verified out-of-band (e.g. the human confirmed the
+        new fingerprint over a call) - it exists so that override is a
+        deliberate, separately-named action a caller has to opt into,
+        rather than something that can happen as a side effect of an
+        ordinary pin() call."""
+        existing = self._trusted.get(name)
+        self._trusted[name] = public_bytes
+        security_logger.security(
+            EventCode.IDENTITY_PINNED,
+            "identity re-pinned after verified key change",
+            peer_name=name,
+            old_fingerprint=_fingerprint(existing) if existing else None,
+            fingerprint=_fingerprint(public_bytes),
+        )
 
     def get(self, name: str):
         raw = self._trusted.get(name)
@@ -162,6 +203,70 @@ class TrustStore:
     def is_trusted(self, name: str, public_bytes: bytes) -> bool:
         pinned = self._trusted.get(name)
         return pinned is not None and pinned == public_bytes
+
+    def verify_and_pin_interactive(
+        self,
+        peer_name: str,
+        peer_pubkey: bytes,
+        label: str,
+        save_path: str = None,
+        input_fn=input,
+        print_fn=print,
+    ) -> tuple:
+        """Terminal-friendly TOFU flow shared by client.py and server.py
+        (and any other interactive caller): on first contact with
+        `peer_name`, shows the peer's claimed fingerprint and requires
+        explicit confirmation before pinning it; on a name that's
+        already pinned, verifies the presented key still matches.
+
+        Returns (trusted, mismatch):
+          - trusted=True: peer is trusted (just pinned, or already matched).
+          - trusted=False, mismatch=False: human declined confirmation.
+          - trusted=False, mismatch=True: presented key differs from the
+            existing pin - possible impersonation, distinct from a plain
+            decline so callers can treat it more seriously (e.g. feed it
+            to a rate limiter) without penalizing someone who just said no.
+
+        `input_fn`/`print_fn` default to the real builtins but are
+        injectable so this can be unit-tested without a real terminal -
+        see test_secure_comms.py's TOFU tests.
+        """
+        if self.get(peer_name) is None:
+            fp = fingerprint_for_bytes(peer_pubkey)
+            print_fn(f"[{label}] '{peer_name}' is not yet trusted.")
+            print_fn(f"[{label}] their identity fingerprint is: {fp}")
+            print_fn(
+                f"[{label}] compare this, out-of-band (in person, on a call, "
+                f"etc.), against the fingerprint '{peer_name}' sees printed "
+                f"as THEIR OWN identity before trusting it. Anyone who "
+                f"skips this step is trusting whoever is on the other end "
+                f"of the TCP connection, not necessarily '{peer_name}'."
+            )
+            answer = (
+                input_fn(
+                    f"[{label}] trust and pin this identity as '{peer_name}'? [y/N]: "
+                )
+                .strip()
+                .lower()
+            )
+            if answer != "y":
+                print_fn(f"[{label}] declined to trust '{peer_name}'. Aborting.")
+                return False, False
+            self.pin(peer_name, peer_pubkey)
+            if save_path:
+                self.save(save_path)
+            print_fn(f"[{label}] TOFU: pinned new identity '{peer_name}' ({fp})")
+            return True, False
+
+        if not self.is_trusted(peer_name, peer_pubkey):
+            print_fn(
+                f"[{label}] !!! WARNING: '{peer_name}' presented a DIFFERENT "
+                f"public key than the one we have pinned. Possible "
+                f"impersonation. Aborting."
+            )
+            return False, True
+
+        return True, False
 
     def save(self, path: str):
         data = {name: raw.hex() for name, raw in self._trusted.items()}

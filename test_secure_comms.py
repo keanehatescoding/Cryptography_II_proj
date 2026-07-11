@@ -15,7 +15,7 @@ Run with:  python3 -m pytest test_secure_comms.py -v
 
 import pytest
 
-from identity import Identity, TrustStore
+from identity import Identity, TrustStore, IdentityMismatchError
 from handshake import (
     initiator_start,
     initiator_finish,
@@ -355,6 +355,150 @@ def test_identity_missing_passphrase_rejected():
 
 
 # ---------------------------------------------------------------------------
+# TOFU interactive trust prompt (client.py / server.py / gui.py share this)
+# ---------------------------------------------------------------------------
+
+
+def _scripted_input(answers):
+    """Returns an input_fn that yields each of `answers` in turn, for
+    driving TrustStore.verify_and_pin_interactive without a real
+    terminal."""
+    it = iter(answers)
+    return lambda prompt="": next(it)
+
+
+def test_tofu_declining_confirmation_does_not_pin():
+    """Regression test for a bug where client.py/server.py auto-pinned a
+    new peer identity on first contact with no human confirmation step,
+    unlike gui.py's "Verify new identity" prompt - meaning an on-path
+    attacker present for the very first connection could substitute
+    their own identity_pub and be silently trusted before the signed
+    handshake ever ran. Fixed by requiring an explicit y/N confirmation
+    (TrustStore.verify_and_pin_interactive) before any pin() call."""
+    trust_store = TrustStore()
+    peer_pubkey = Identity("mallory").public_bytes
+
+    trusted, mismatch = trust_store.verify_and_pin_interactive(
+        "mallory",
+        peer_pubkey,
+        "test",
+        input_fn=_scripted_input(["n"]),  # declines confirmation
+        print_fn=lambda *a, **k: None,
+    )
+
+    assert trusted is False
+    assert mismatch is False
+    # The whole point: declining must leave the peer unpinned.
+    assert trust_store.get("mallory") is None
+    assert trust_store.is_trusted("mallory", peer_pubkey) is False
+
+
+def test_tofu_confirming_pins_the_identity():
+    trust_store = TrustStore()
+    peer = Identity("bob")
+
+    trusted, mismatch = trust_store.verify_and_pin_interactive(
+        "bob",
+        peer.public_bytes,
+        "test",
+        input_fn=_scripted_input(["y"]),
+        print_fn=lambda *a, **k: None,
+    )
+
+    assert trusted is True
+    assert mismatch is False
+    assert trust_store.is_trusted("bob", peer.public_bytes) is True
+
+
+def test_tofu_confirmation_prompt_shows_the_peers_fingerprint():
+    """The whole point of the prompt is that the human can compare a
+    fingerprint out-of-band before trusting it - make sure the actual
+    fingerprint of the presented key is what gets shown, not e.g. a
+    placeholder or the wrong key's fingerprint."""
+    trust_store = TrustStore()
+    peer = Identity("bob")
+    shown = []
+
+    trust_store.verify_and_pin_interactive(
+        "bob",
+        peer.public_bytes,
+        "test",
+        input_fn=_scripted_input(["y"]),
+        print_fn=lambda msg="": shown.append(msg),
+    )
+
+    assert any(peer.fingerprint in line for line in shown)
+
+
+def test_tofu_existing_pin_mismatch_is_not_overwritten_and_flagged():
+    """An already-trusted name presenting a DIFFERENT key must be
+    rejected outright (no confirmation prompt at all - that's only for
+    first contact) and reported as a mismatch, not a plain decline, so
+    callers can treat it more seriously (e.g. server.py's rate limiter)."""
+    trust_store = TrustStore()
+    real_bob = Identity("bob")
+    attacker = Identity("attacker-pretending-to-be-bob")
+    trust_store.pin("bob", real_bob.public_bytes)
+
+    trusted, mismatch = trust_store.verify_and_pin_interactive(
+        "bob",
+        attacker.public_bytes,
+        "test",
+        input_fn=_scripted_input([]),  # must not even be asked
+        print_fn=lambda *a, **k: None,
+    )
+
+    assert trusted is False
+    assert mismatch is True
+    # The original pin must survive untouched.
+    assert trust_store.is_trusted("bob", real_bob.public_bytes) is True
+    assert trust_store.is_trusted("bob", attacker.public_bytes) is False
+
+
+def test_pin_raises_on_mismatch_instead_of_silently_overwriting():
+    """pin() itself (independent of the interactive wrapper above) must
+    refuse a key change for an already-pinned name rather than quietly
+    accepting it - a caller that ignores the return value of a
+    non-raising pin() would otherwise sail right past what's supposed
+    to be a security-relevant event."""
+    trust_store = TrustStore()
+    real_bob = Identity("bob")
+    attacker = Identity("attacker-pretending-to-be-bob")
+    trust_store.pin("bob", real_bob.public_bytes)
+
+    with pytest.raises(IdentityMismatchError):
+        trust_store.pin("bob", attacker.public_bytes)
+
+    # The failed pin() call must not have partially applied.
+    assert trust_store.is_trusted("bob", real_bob.public_bytes) is True
+
+
+def test_pin_is_idempotent_for_the_same_key():
+    """Re-pinning a name to the SAME key it's already pinned to must
+    stay a no-op, not raise - only an actual key change is a mismatch."""
+    trust_store = TrustStore()
+    bob = Identity("bob")
+    trust_store.pin("bob", bob.public_bytes)
+    trust_store.pin("bob", bob.public_bytes)  # must not raise
+    assert trust_store.is_trusted("bob", bob.public_bytes) is True
+
+
+def test_repin_explicitly_overrides_an_existing_pin():
+    """repin() is the deliberate override an operator reaches for after
+    verifying a key change out-of-band - it must succeed where pin()
+    would raise, and the new key must actually take effect."""
+    trust_store = TrustStore()
+    old_key = Identity("bob")
+    new_key = Identity("bob-reinstalled")
+    trust_store.pin("bob", old_key.public_bytes)
+
+    trust_store.repin("bob", new_key.public_bytes)
+
+    assert trust_store.is_trusted("bob", new_key.public_bytes) is True
+    assert trust_store.is_trusted("bob", old_key.public_bytes) is False
+
+
+# ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
 
@@ -505,6 +649,51 @@ def test_truncated_rekey_header_is_rejected():
     truncated = ct[:10]  # cut off partway through the attached pubkey
     with pytest.raises(TamperError):
         bob_channel.decrypt(truncated)
+
+
+def test_forged_rekey_packet_does_not_corrupt_channel_state():
+    """Regression test for a bug where decrypt() applied an announced DH
+    ratchet step (root key, receiving chains, peer ratchet pubkey) BEFORE
+    the GCM tag on that message was checked. A forged packet with a
+    fake rekey header and a bogus ciphertext/tag was correctly rejected
+    as tampered, but the ratchet step had already mutated state by then
+    - so an attacker who could inject a single unauthenticated packet
+    could corrupt the channel (fork the root key, evict legitimate old
+    receiving chains, clobber the pinned peer ratchet pubkey) without
+    ever producing a valid tag. Fixed by computing the candidate step
+    into a local object and only committing it after decryption
+    succeeds."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+
+    root_before = bob_channel._root_key
+    peer_pub_before = bob_channel._peer_ratchet_pub_bytes
+    chains_before = dict(bob_channel._recv_chains)
+
+    # Forge a packet: FLAG_REKEY set, a fresh attacker-controlled pubkey
+    # attached, a counter far ahead of anything seen (so it passes the
+    # freshness check), but garbage ciphertext/tag - the attacker has no
+    # valid message key.
+    _, attacker_pub = cu.generate_x25519_keypair()
+    attacker_pub_bytes = cu.x25519_public_bytes(attacker_pub)
+    counter = 999
+    header = bytes([SecureChannel.FLAG_REKEY]) + attacker_pub_bytes
+    aad = header + counter.to_bytes(8, "big")
+    forged = aad + b"\x00" * 32  # bogus ciphertext + tag, fails GCM
+
+    with pytest.raises(TamperError):
+        bob_channel.decrypt(forged)
+
+    # The forged packet must be rejected AND leave no trace: none of the
+    # ratchet state should have moved, or a single unauthenticated
+    # packet could desync/corrupt the channel.
+    assert bob_channel._root_key == root_before
+    assert bob_channel._peer_ratchet_pub_bytes == peer_pub_before
+    assert bob_channel._recv_chains.keys() == chains_before.keys()
+
+    # And the channel must still work normally afterward.
+    ct = alice_channel.encrypt(b"still works")
+    assert bob_channel.decrypt(ct) == b"still works"
 
 
 def test_padding_round_trips_for_various_sizes():

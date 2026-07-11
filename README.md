@@ -177,6 +177,19 @@ and through a real SecureChannel), corrupted-length-prefix rejection,
 too-short-input rejection, and the opt-out path for callers who disable
 padding. 39 tests in total.
 
+5 more cover the TOFU trust-prompt flow shared by client.py and
+server.py (`TrustStore.verify_and_pin_interactive`): declining
+confirmation on first contact leaves the peer unpinned, confirming pins
+it and shows the peer's actual fingerprint (not a placeholder), and an
+already-pinned name presenting a different key is rejected outright
+without ever prompting - distinguished from a plain decline so callers
+can rate-limit it separately. Plus a regression test for a fixed bug
+where a forged rekey packet with an invalid GCM tag could still
+corrupt receiving-side ratchet state (root key, receiving chains,
+pinned peer pubkey) before the forgery was caught - decrypt() now
+computes a candidate ratchet step and only commits it after
+authentication succeeds. 44 tests in total.
+
 ## Running the live demo
 
 Two terminals, same directory:
@@ -196,6 +209,12 @@ On first run each side is asked whether to encrypt its identity key with
 a passphrase (recommended); on later runs you'll be prompted for it. The
 server keeps listening and accepts new peers after a session ends, and
 throttles an address that fails the handshake repeatedly.
+
+On first contact with a new peer, you'll see their identity fingerprint
+printed and be asked to confirm - out-of-band, e.g. read aloud on a call
+- that it matches before it's pinned (same SSH-style TOFU flow the GUI
+uses; see below). Declining aborts the connection without pinning
+anything.
 
 ## Running the GUI
 
