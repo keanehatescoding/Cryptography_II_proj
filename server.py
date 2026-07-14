@@ -26,6 +26,7 @@ from handshake import (
 )
 from secure_channel import ReplayError, TamperError
 from rate_limiter import RateLimiter
+from audit_log import configure_logging
 
 HOST, PORT = "127.0.0.1", 6543
 KEY_DIR = "./demo_keys"
@@ -126,6 +127,8 @@ def handle_connection(
 
 
 def main():
+    configure_logging(logfile="bob_audit.log", also_stderr=False)
+
     me = load_or_create_identity("bob")
     trust_store = TrustStore.load(f"{KEY_DIR}/bob_trust.json")
     limiter = RateLimiter(max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0)

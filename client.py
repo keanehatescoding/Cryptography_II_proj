@@ -22,6 +22,7 @@ from handshake import (
     HandshakeError,
 )
 from secure_channel import ReplayError, TamperError
+from audit_log import configure_logging
 
 HOST, PORT = "127.0.0.1", 6543
 KEY_DIR = "./demo_keys"
@@ -61,6 +62,12 @@ def load_or_create_identity(name: str) -> Identity:
 
 
 def main():
+    # Application entry point - the one place allowed to decide where
+    # security-audit events go. Kept off stderr by default so it doesn't
+    # interleave with the interactive prompts below; tail the file to
+    # watch events live: tail -f alice_audit.log
+    configure_logging(logfile="alice_audit.log", also_stderr=False)
+
     me = load_or_create_identity("alice")
     trust_store = TrustStore.load(f"{KEY_DIR}/alice_trust.json")
 

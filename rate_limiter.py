@@ -25,6 +25,8 @@ DoS-mitigation solution.
 import time
 from collections import defaultdict, deque
 
+from audit_log import EventCode, security_logger
+
 
 class RateLimiter:
     def __init__(
@@ -64,6 +66,14 @@ class RateLimiter:
             attempts.popleft()
         if len(attempts) >= self.max_attempts:
             self._blocked_until[key] = now + self.cooldown_seconds
+            security_logger.security(
+                EventCode.RATE_LIMIT_TRIGGERED,
+                "rate limit triggered - too many failed attempts",
+                key=key,
+                attempts=len(attempts),
+                window_seconds=self.window_seconds,
+                cooldown_seconds=self.cooldown_seconds,
+            )
             attempts.clear()
 
     def record_success(self, key: str):

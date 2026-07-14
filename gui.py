@@ -40,6 +40,7 @@ from handshake import (
 from identity import Identity, TrustStore, fingerprint_for_bytes
 from rate_limiter import RateLimiter
 from secure_channel import ReplayError, TamperError
+from audit_log import configure_logging
 
 KEY_DIR = "./gui_keys"
 
@@ -586,5 +587,9 @@ class SecureCommsApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    # One shared logfile: this window may act as either "alice" or "bob"
+    # depending on the name entered in the form, so events aren't split
+    # per-identity the way the CLI demo's are.
+    configure_logging(logfile="secure_comms_audit.log", also_stderr=False)
     app = SecureCommsApp()
     app.mainloop()
