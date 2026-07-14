@@ -15,8 +15,11 @@ Run with:
     python3 gui.py
 """
 
+import platform
 import queue
+import shutil
 import socket
+import subprocess
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -39,6 +42,46 @@ from rate_limiter import RateLimiter
 from secure_channel import ReplayError, TamperError
 
 KEY_DIR = "./gui_keys"
+
+
+def _notify_desktop(title: str, message: str) -> None:
+    """Best-effort native OS notification for an incoming message.
+
+    Deliberately dependency-free (uses whatever notifier ships with the
+    OS) and deliberately swallows every error: a missing `notify-send`
+    binary or a sandboxed/headless environment should never crash the
+    chat session over a nice-to-have.
+    """
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            # osascript ships with every macOS install.
+            safe_title = title.replace('"', '\\"')
+            safe_msg = message.replace('"', '\\"')
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "{safe_msg}" with title "{safe_title}"',
+                ],
+                check=False,
+                timeout=2,
+            )
+        elif system == "Linux":
+            if shutil.which("notify-send"):
+                subprocess.run(
+                    ["notify-send", "--", title, message],
+                    check=False,
+                    timeout=2,
+                )
+            # No notify-send available (e.g. minimal WM/headless): the
+            # audible bell + title badge still cover it.
+        # Windows: a real toast needs either pywin32 or the winrt package,
+        # which we don't want to add as a hard dependency. The audible
+        # bell + unread-count title badge (below) already work there
+        # unmodified, so we skip a native popup on Windows for now.
+    except Exception:
+        pass
 
 
 class PassphraseNeeded(Exception):
@@ -293,6 +336,13 @@ class SecureCommsApp(tk.Tk):
         self.worker: PeerWorker | None = None
         self.events: queue.Queue = queue.Queue()
 
+        # -- new-message notifications ---------------------------------
+        self._base_title = "Secure Comms"
+        self._window_focused = True
+        self._unread_count = 0
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+
         self._build_connect_frame()
         self._build_chat_frame()
         self.chat_frame.pack_forget()
@@ -448,6 +498,33 @@ class SecureCommsApp(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    # -- new-message notifications ---------------------------------------
+
+    def _on_focus_in(self, _event=None):
+        self._window_focused = True
+        self._unread_count = 0
+        self.title(self._base_title)
+
+    def _on_focus_out(self, _event=None):
+        self._window_focused = False
+
+    def _notify_incoming(self, sender: str, text: str):
+        """Alert the user to a newly-received (already-decrypted) message.
+
+        Called from _handle_event, which runs on the GUI thread via the
+        Tk .after() poll loop, so it's safe to touch widgets directly.
+        The audible bell always fires; the OS popup and title badge are
+        reserved for when the window isn't focused, so this doesn't add
+        noise while you're actively looking at the conversation.
+        """
+        self.bell()
+        if self._window_focused:
+            return
+        self._unread_count += 1
+        self.title(f"({self._unread_count}) {self._base_title} - new message")
+        preview = text if len(text) <= 80 else text[:77] + "..."
+        _notify_desktop(f"New message from {sender}", preview)
+
     # -- event loop --------------------------------------------------------
 
     def _poll_events(self):
@@ -498,6 +575,7 @@ class SecureCommsApp(tk.Tk):
             self.msg_entry.focus_set()
         elif kind == "message":
             self._log(ev["text"], "peer", label=ev["sender"])
+            self._notify_incoming(ev["sender"], ev["text"])
         elif kind == "security_alert":
             self._log(f"SECURITY ALERT: {ev['text']}", "alert")
 
