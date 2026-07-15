@@ -21,6 +21,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -77,12 +78,103 @@ def _notify_desktop(title: str, message: str) -> None:
                 )
             # No notify-send available (e.g. minimal WM/headless): the
             # audible bell + title badge still cover it.
-        # Windows: a real toast needs either pywin32 or the winrt package,
-        # which we don't want to add as a hard dependency. The audible
-        # bell + unread-count title badge (below) already work there
-        # unmodified, so we skip a native popup on Windows for now.
+        elif system == "Windows":
+            _notify_windows(title, message)
     except Exception:
         pass
+
+
+def _notify_windows(title: str, message: str) -> None:
+    """Native Windows balloon notification via pywin32's Shell_NotifyIcon.
+
+    pywin32 is an optional dependency (not in requirements.txt), so the
+    import happens lazily here and any failure is swallowed exactly like
+    the other OS branches in _notify_desktop - a missing pywin32 install
+    should never crash the chat session over a nice-to-have.
+
+    The whole register-window / add-icon / pop-balloon / tear-down
+    sequence runs on its own daemon thread because it needs a short
+    sleep to give the balloon time to actually appear before the icon
+    is removed, and that must never block the Tk main loop.
+    """
+
+    def _show():
+        try:
+            import win32api
+            import win32con
+            import win32gui
+        except ImportError:
+            return
+
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.hInstance = win32api.GetModuleHandle(None)
+            wc.lpszClassName = "SecureCommsNotifyIcon"
+            wc.lpfnWndProc = {win32con.WM_DESTROY: lambda hwnd, msg, wparam, lparam: 0}
+
+            try:
+                class_atom = win32gui.RegisterClass(wc)
+            except win32gui.error:
+                # Already registered by an earlier notification in this
+                # process - reuse the class name instead of failing.
+                class_atom = wc.lpszClassName
+
+            hwnd = win32gui.CreateWindow(
+                class_atom,
+                "SecureCommsNotifyWindow",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                wc.hInstance,
+                None,
+            )
+            win32gui.UpdateWindow(hwnd)
+        except Exception:
+            return
+
+        try:
+            hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+            flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
+            win32gui.Shell_NotifyIcon(
+                win32gui.NIM_ADD,
+                (hwnd, 0, flags, win32con.WM_USER + 20, hicon, "Secure Comms"),
+            )
+            win32gui.Shell_NotifyIcon(
+                win32gui.NIM_MODIFY,
+                (
+                    hwnd,
+                    0,
+                    win32gui.NIF_INFO,
+                    win32con.WM_USER + 20,
+                    hicon,
+                    "Secure Comms",
+                    message,
+                    200,
+                    title,
+                    win32gui.NIIF_INFO,
+                ),
+            )
+            # The balloon pop is asynchronous; hold the tray icon around
+            # long enough for Windows to actually display it before we
+            # clean up, or it can get dropped silently.
+            time.sleep(4)
+        except Exception:
+            pass
+        finally:
+            try:
+                win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
+            except Exception:
+                pass
+            try:
+                win32gui.DestroyWindow(hwnd)
+            except Exception:
+                pass
+
+    threading.Thread(target=_show, daemon=True).start()
 
 
 class PassphraseNeeded(Exception):
