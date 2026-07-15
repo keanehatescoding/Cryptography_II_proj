@@ -2,3 +2,5 @@ gui_keys/
 demo_keys/
 *.pem
 __pycache__
+.venv
+secure_comms_audit.log
