@@ -28,7 +28,7 @@ from secure_channel import ReplayError, TamperError
 from rate_limiter import RateLimiter
 from audit_log import configure_logging
 
-HOST, PORT = "127.0.0.1", 6543
+HOST, PORT = "127.0.0.1", 8000
 KEY_DIR = "./demo_keys"
 
 

@@ -476,7 +476,7 @@ class SecureCommsApp(tk.Tk):
         )
 
         ttk.Label(form, text="Port:").grid(row=2, column=0, sticky="w", pady=4)
-        self.port_var = tk.StringVar(value="6543")
+        self.port_var = tk.StringVar(value="8000")
         ttk.Entry(form, textvariable=self.port_var).grid(
             row=2, column=1, sticky="ew", pady=4
         )
