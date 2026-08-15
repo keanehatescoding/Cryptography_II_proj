@@ -100,9 +100,9 @@ def _notify_windows(title: str, message: str) -> None:
 
     def _show():
         try:
-            import win32api
-            import win32con
-            import win32gui
+            import win32api  # ty:ignore[unresolved-import]
+            import win32con  # ty:ignore[unresolved-import]
+            import win32gui  # ty:ignore[unresolved-import]
         except ImportError:
             return
 
