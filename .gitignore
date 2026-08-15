@@ -1,5 +1,6 @@
 gui_keys/
 demo_keys/
+received_files/
 *.pem
 __pycache__
 .venv

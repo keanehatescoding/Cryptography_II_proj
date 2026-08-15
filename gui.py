@@ -15,6 +15,8 @@ Run with:
     python3 gui.py
 """
 
+import hashlib
+import json
 import platform
 import queue
 import shutil
@@ -23,9 +25,10 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import uuid
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import transport
 from handshake import (
@@ -44,6 +47,61 @@ from secure_channel import ReplayError, TamperError
 from audit_log import configure_logging
 
 KEY_DIR = "./gui_keys"
+FILE_RECV_DIR = Path("./received_files")
+
+# Every application-level plaintext handed to SecureChannel.encrypt() is
+# prefixed with one of these type bytes so text and file traffic can share
+# the same encrypted stream. TCP already guarantees in-order delivery on a
+# single connection, so a file's chunks never need their own sequence
+# numbers - just a 16-byte transfer id to tell concurrent chunk streams
+# apart (interleaved with normal chat messages) and to disambiguate a stray
+# chunk left over after a reconnect drops an in-progress transfer.
+MSG_TEXT = 0x01
+MSG_FILE_OFFER = 0x02
+MSG_FILE_CHUNK = 0x03
+
+FILE_CHUNK_SIZE = 256 * 1024
+MAX_FILE_SIZE = 200 * 1024 * 1024  # sanity cap for this demo app
+
+
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _encode_file_offer(file_id: bytes, name: str, size: int, sha256_hex: str) -> bytes:
+    payload = json.dumps(
+        {"id": file_id.hex(), "name": name, "size": size, "sha256": sha256_hex}
+    ).encode("utf-8")
+    return bytes([MSG_FILE_OFFER]) + payload
+
+
+def _encode_file_chunk(file_id: bytes, chunk: bytes) -> bytes:
+    return bytes([MSG_FILE_CHUNK]) + file_id + chunk
+
+
+def _unique_dest_path(directory: Path, name: str) -> Path:
+    """Picks a non-colliding path under `directory` for an incoming file.
+
+    `Path(name).name` strips any directory components a malicious or buggy
+    peer might embed (e.g. "../../etc/passwd") so a received file can never
+    be written outside `directory`.
+    """
+    safe_name = Path(name).name or "received_file"
+    candidate = directory / safe_name
+    if not candidate.exists():
+        return candidate
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+    i = 1
+    while True:
+        candidate = directory / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
 
 
 def _notify_desktop(title: str, message: str) -> None:
@@ -204,7 +262,18 @@ class PeerWorker(threading.Thread):
     time it needs a decision from the human (e.g. "trust this new
     identity?") it blocks on a threading.Event until the GUI thread
     supplies an answer - this keeps Tk's single-threaded UI rule intact
-    while still letting the crypto/network code run synchronously."""
+    while still letting the crypto/network code run synchronously.
+
+    A dropped connection does not end the thread: run() loops, retrying
+    the connect (role="connect") or going back to listening for a new
+    peer (role="host") with exponential backoff, until stop() is called.
+    Each reconnect performs a brand-new handshake - there is no session
+    resumption, so a reconnect starts a fresh ratchet chain exactly like
+    a manual restart would (see README: "No reconnect/resumption").
+    """
+
+    RECONNECT_BASE_DELAY = 1.0
+    RECONNECT_MAX_DELAY = 30.0
 
     def __init__(
         self,
@@ -226,6 +295,11 @@ class PeerWorker(threading.Thread):
         self.channel = None
         self.peer_name = None
         self._stop = threading.Event()
+        self._send_lock = threading.Lock()
+        self._srv = None
+        self._limiter = None
+        self._reconnect_attempt = 0
+        self._inbound_transfers = {}
 
     def emit(self, kind, **kwargs):
         self.events.put({"kind": kind, **kwargs})
@@ -235,11 +309,6 @@ class PeerWorker(threading.Thread):
             self.identity = load_or_create_identity(self.name, self.passphrase)
             self.trust_store = TrustStore.load(f"{KEY_DIR}/{self.name}_trust.json")
             self.emit("identity", fingerprint=self.identity.fingerprint)
-
-            if self.role == "host":
-                self._run_host()
-            else:
-                self._run_connect()
         except PassphraseNeeded:
             self.emit(
                 "error",
@@ -250,39 +319,102 @@ class PeerWorker(threading.Thread):
         except ValueError:
             self.emit("error", text="Incorrect passphrase.")
             return
-        except HandshakeError as e:
-            self.emit("error", text=f"Handshake failed: {e}")
-            return
-        except (ConnectionError, OSError) as e:
-            self.emit("error", text=f"Connection error: {e}")
-            return
         except Exception as e:  # noqa: BLE001 - surface anything unexpected to the UI
             self.emit("error", text=f"Unexpected error: {e}")
             return
 
-        self._recv_loop()
+        while not self._stop.is_set():
+            try:
+                if self.role == "host":
+                    connected = self._run_host()
+                else:
+                    connected = self._run_connect()
+            except HandshakeError as e:
+                # A failed handshake with the transport already up (bad
+                # signature, unpinned/mismatched identity) is a crypto or
+                # trust failure, not a network blip - don't mask it behind
+                # an automatic retry loop.
+                self.emit("error", text=f"Handshake failed: {e}")
+                return
+            except (ConnectionError, OSError) as e:
+                if self._stop.is_set():
+                    return
+                if not self._reconnect_wait(str(e)):
+                    return
+                continue
+            except Exception as e:  # noqa: BLE001
+                self.emit("error", text=f"Unexpected error: {e}")
+                return
 
-    def _run_host(self):
+            if not connected:
+                return  # stop() was set before a handshake ever completed
+
+            self._reconnect_attempt = 0
+            self.emit("handshake_done")
+            self._recv_loop()
+            self._abort_inbound_transfers()
+            self.channel = None
+            self.sock = None
+            if self._stop.is_set():
+                return
+            self.emit("connection_lost")
+            if not self._reconnect_wait("Connection lost."):
+                return
+
+    def _reconnect_wait(self, reason: str) -> bool:
+        """Sleeps out an exponential backoff, checking _stop every 200ms
+        so a Disconnect click or window close interrupts it promptly.
+        Returns False if stop() fired during (or before) the wait."""
+        self._reconnect_attempt += 1
+        delay = self._compute_backoff_delay(self._reconnect_attempt)
         self.emit(
-            "status", text=f"Waiting for a connection on {self.host}:{self.port}..."
+            "status",
+            text=f"{reason} Reconnecting in {delay:.0f}s "
+            f"(attempt {self._reconnect_attempt})...",
         )
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.host, self.port))
-        srv.listen(5)
+        waited = 0.0
+        step = 0.2
+        while waited < delay:
+            if self._stop.is_set():
+                return False
+            time.sleep(step)
+            waited += step
+        return not self._stop.is_set()
 
-        # Persists across repeated connection attempts on this listen
-        # socket, so a peer who fails the handshake a few times in a row
-        # gets throttled rather than allowed unlimited retries.
-        limiter = RateLimiter(
-            max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0
-        )
+    @classmethod
+    def _compute_backoff_delay(cls, attempt: int) -> float:
+        return min(cls.RECONNECT_BASE_DELAY * (2 ** (attempt - 1)), cls.RECONNECT_MAX_DELAY)
+
+    def _run_host(self) -> bool:
+        if self._srv is None:
+            self.emit(
+                "status",
+                text=f"Waiting for a connection on {self.host}:{self.port}...",
+            )
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.host, self.port))
+            srv.listen(5)
+            srv.settimeout(0.5)  # lets the accept loop notice self._stop
+            self._srv = srv
+            # Persists across repeated connection attempts on this listen
+            # socket (and across reconnects), so a peer who fails the
+            # handshake a few times in a row gets throttled rather than
+            # allowed unlimited retries.
+            self._limiter = RateLimiter(
+                max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0
+            )
+        else:
+            self.emit("status", text=f"Waiting for a peer on {self.host}:{self.port}...")
 
         while not self._stop.is_set():
-            conn, addr = srv.accept()
+            try:
+                conn, addr = self._srv.accept()
+            except socket.timeout:
+                continue
             ip = addr[0]
-            if limiter.is_blocked(ip):
-                wait = limiter.seconds_until_unblocked(ip)
+            if self._limiter.is_blocked(ip):
+                wait = self._limiter.seconds_until_unblocked(ip)
                 self.emit(
                     "status",
                     text=f"Rejected connection from {ip} - "
@@ -303,7 +435,7 @@ class PeerWorker(threading.Thread):
                 msg3 = HandshakeMessage3.from_wire(transport.recv_json(self.sock))
                 self.channel = responder_finish(self.trust_store, state, msg3)
             except HandshakeError as e:
-                limiter.record_failure(ip)
+                self._limiter.record_failure(ip)
                 self.emit(
                     "status",
                     text=f"Handshake with {ip} failed ({e}). Waiting for next peer...",
@@ -315,17 +447,17 @@ class PeerWorker(threading.Thread):
                 self.sock = None
                 continue
 
-            limiter.record_success(ip)
-            self.emit("handshake_done")
-            srv.close()
-            return
+            self._limiter.record_success(ip)
+            return True
 
-        srv.close()
+        return False
 
-    def _run_connect(self):
+    def _run_connect(self) -> bool:
         self.emit("status", text=f"Connecting to {self.host}:{self.port}...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
         sock.connect((self.host, self.port))
+        sock.settimeout(None)
         self.sock = sock
         self.emit("status", text="Connected. Starting handshake...")
 
@@ -338,7 +470,7 @@ class PeerWorker(threading.Thread):
             self.identity, self.trust_store, state, msg2
         )
         transport.send_json(self.sock, msg3.to_wire())
-        self.emit("handshake_done")
+        return True
 
     def _exchange_identity_and_pin(self):
         transport.send_json(
@@ -391,30 +523,205 @@ class PeerWorker(threading.Thread):
             try:
                 framed = transport.recv_bytes(self.sock)
             except (ConnectionError, OSError):
-                self.emit("status", text="Connection closed.")
                 return
             try:
                 plaintext = self.channel.decrypt(framed)
             except (ReplayError, TamperError) as e:
                 self.emit("security_alert", text=str(e))
                 continue
+            self._handle_plaintext(plaintext)
+
+    def _handle_plaintext(self, plaintext: bytes):
+        if not plaintext:
+            return
+        msg_type, body = plaintext[0], plaintext[1:]
+        if msg_type == MSG_TEXT:
             self.emit(
-                "message",
-                sender=self.peer_name,
-                text=plaintext.decode("utf-8", "replace"),
+                "message", sender=self.peer_name, text=body.decode("utf-8", "replace")
             )
+        elif msg_type == MSG_FILE_OFFER:
+            self._handle_file_offer(body)
+        elif msg_type == MSG_FILE_CHUNK:
+            self._handle_file_chunk(body)
+        # Unknown type bytes are ignored rather than treated as tampering:
+        # the GCM tag already authenticated this payload, so an unexpected
+        # type only means a future/older protocol version, not an attack.
+
+    def _handle_file_offer(self, body: bytes):
+        try:
+            meta = json.loads(body.decode("utf-8"))
+            file_id = bytes.fromhex(meta["id"])
+            name = str(meta["name"])
+            size = int(meta["size"])
+            sha256_hex = str(meta["sha256"])
+        except (json.JSONDecodeError, KeyError, ValueError, UnicodeDecodeError):
+            self.emit("security_alert", text="Received a malformed file offer.")
+            return
+        if size > MAX_FILE_SIZE:
+            self.emit(
+                "security_alert",
+                text=f"Peer offered an oversized file ({_human_size(size)}); refusing.",
+            )
+            return
+
+        FILE_RECV_DIR.mkdir(parents=True, exist_ok=True)
+        dest = _unique_dest_path(FILE_RECV_DIR, name)
+        try:
+            handle = open(dest, "wb")
+        except OSError as e:
+            self.emit("error", text=f"Can't save incoming file: {e}")
+            return
+
+        self._inbound_transfers[file_id] = {
+            "name": name,
+            "size": size,
+            "sha256": sha256_hex,
+            "received": 0,
+            "handle": handle,
+            "path": dest,
+            "digest": hashlib.sha256(),
+        }
+        self.emit("file_offer", name=name, size=size)
+
+    def _handle_file_chunk(self, body: bytes):
+        if len(body) < 16:
+            self.emit("security_alert", text="Received a malformed file chunk.")
+            return
+        file_id, data = body[:16], body[16:]
+        transfer = self._inbound_transfers.get(file_id)
+        if transfer is None:
+            # No matching offer - most likely a leftover chunk from a
+            # transfer that was in flight when the connection dropped and
+            # got abandoned on reconnect. Drop it rather than crash.
+            return
+
+        transfer["handle"].write(data)
+        transfer["digest"].update(data)
+        transfer["received"] += len(data)
+        self.emit(
+            "file_recv_progress",
+            name=transfer["name"],
+            received=transfer["received"],
+            total=transfer["size"],
+        )
+
+        if transfer["received"] >= transfer["size"]:
+            transfer["handle"].close()
+            del self._inbound_transfers[file_id]
+            if transfer["digest"].hexdigest() != transfer["sha256"]:
+                self.emit(
+                    "security_alert",
+                    text=f"Integrity check failed for received file "
+                    f"'{transfer['name']}' - discarding.",
+                )
+                try:
+                    transfer["path"].unlink()
+                except OSError:
+                    pass
+                return
+            self.emit(
+                "file_received",
+                name=transfer["name"],
+                size=transfer["size"],
+                path=str(transfer["path"]),
+            )
+
+    def _abort_inbound_transfers(self):
+        for transfer in self._inbound_transfers.values():
+            try:
+                transfer["handle"].close()
+            except OSError:
+                pass
+            try:
+                transfer["path"].unlink()
+            except OSError:
+                pass
+        self._inbound_transfers.clear()
+
+    def _send_raw(self, plaintext: bytes):
+        if self.channel is None or self.sock is None:
+            raise ConnectionError("Not connected.")
+        framed = self.channel.encrypt(plaintext)
+        # encrypt() must run before the lock (it mutates ratchet state and
+        # must stay in this caller's order relative to other encrypt()
+        # calls from the same thread); the lock only needs to serialize
+        # the actual socket write against other threads (e.g. a
+        # background file-send) writing to the same socket concurrently.
+        with self._send_lock:
+            transport.send_bytes(self.sock, framed)
 
     def send(self, text: str):
         if self.channel is None or self.sock is None:
             return
-        framed = self.channel.encrypt(text.encode("utf-8"))
-        transport.send_bytes(self.sock, framed)
+        self._send_raw(bytes([MSG_TEXT]) + text.encode("utf-8"))
+
+    def send_file(self, path_str: str):
+        threading.Thread(target=self._send_file, args=(path_str,), daemon=True).start()
+
+    def _send_file(self, path_str: str):
+        path = Path(path_str)
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            self.emit("file_send_failed", name=path.name, text=str(e))
+            return
+        if size > MAX_FILE_SIZE:
+            self.emit(
+                "file_send_failed",
+                name=path.name,
+                text=f"file is {_human_size(size)}, limit is "
+                f"{_human_size(MAX_FILE_SIZE)}",
+            )
+            return
+
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(FILE_CHUNK_SIZE), b""):
+                    digest.update(chunk)
+        except OSError as e:
+            self.emit("file_send_failed", name=path.name, text=str(e))
+            return
+
+        file_id = uuid.uuid4().bytes
+        try:
+            self._send_raw(_encode_file_offer(file_id, path.name, size, digest.hexdigest()))
+            sent = 0
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(FILE_CHUNK_SIZE), b""):
+                    self._send_raw(_encode_file_chunk(file_id, chunk))
+                    sent += len(chunk)
+                    self.emit(
+                        "file_send_progress", name=path.name, sent=sent, total=size
+                    )
+        except (ConnectionError, OSError) as e:
+            self.emit("file_send_failed", name=path.name, text=str(e))
+            return
+
+        self.emit("file_sent", name=path.name, size=size)
 
     def stop(self):
         self._stop.set()
+        # Plain close() from this (GUI) thread does not reliably unblock a
+        # recv() the worker thread is blocked in on the same socket - the
+        # kernel won't tear the connection down (and send the peer a FIN)
+        # until every thread's reference to it is released, and the
+        # blocked recv() itself holds one of those references. shutdown()
+        # forces it immediately regardless of what other threads are
+        # doing with the socket.
+        try:
+            if self.sock:
+                self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             if self.sock:
                 self.sock.close()
+        except OSError:
+            pass
+        try:
+            if self._srv:
+                self._srv.close()
         except OSError:
             pass
 
@@ -428,6 +735,7 @@ class SecureCommsApp(tk.Tk):
 
         self.worker: PeerWorker | None = None
         self.events: queue.Queue = queue.Queue()
+        self._chat_shown = False
 
         # -- new-message notifications ---------------------------------
         self._base_title = "Secure Comms"
@@ -523,10 +831,15 @@ class SecureCommsApp(tk.Tk):
         frame = ttk.Frame(self, padding=12)
         self.chat_frame = frame
 
+        header_row = ttk.Frame(frame)
+        header_row.pack(fill="x")
         self.header_var = tk.StringVar(value="")
         ttk.Label(
-            frame, textvariable=self.header_var, font=("", 11, "bold"), wraplength=520
-        ).pack(anchor="w")
+            header_row, textvariable=self.header_var, font=("", 11, "bold"), wraplength=440
+        ).pack(side="left", anchor="w")
+        ttk.Button(header_row, text="Disconnect", command=self._disconnect).pack(
+            side="right"
+        )
 
         self.log = scrolledtext.ScrolledText(frame, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, pady=8)
@@ -535,15 +848,29 @@ class SecureCommsApp(tk.Tk):
         self.log.tag_config("system", foreground="#888888")
         self.log.tag_config("alert", foreground="#cc0000", font=("", 10, "bold"))
 
+        self.transfer_var = tk.StringVar(value="")
+        self.transfer_frame = ttk.Frame(frame)
+        ttk.Label(
+            self.transfer_frame, textvariable=self.transfer_var, foreground="#555"
+        ).pack(side="left")
+        self.transfer_bar = ttk.Progressbar(
+            self.transfer_frame, mode="determinate", length=200
+        )
+        self.transfer_bar.pack(side="left", padx=(6, 0), fill="x", expand=True)
+
         entry_row = ttk.Frame(frame)
         entry_row.pack(fill="x")
+        self.entry_row = entry_row
         self.msg_var = tk.StringVar()
         entry = ttk.Entry(entry_row, textvariable=self.msg_var)
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<Return>", lambda _e: self._send())
-        ttk.Button(entry_row, text="Send", command=self._send).pack(
-            side="left", padx=(6, 0)
+        self.send_btn = ttk.Button(entry_row, text="Send", command=self._send)
+        self.send_btn.pack(side="left", padx=(6, 0))
+        self.sendfile_btn = ttk.Button(
+            entry_row, text="Send File…", command=self._send_file
         )
+        self.sendfile_btn.pack(side="left", padx=(6, 0))
         self.msg_entry = entry
 
     # -- actions ---------------------------------------------------------
@@ -582,6 +909,49 @@ class SecureCommsApp(tk.Tk):
         self.worker.send(text)
         self._log(text, "me", label=self.worker.name)
         self.msg_var.set("")
+
+    def _send_file(self):
+        if self.worker is None or self.worker.channel is None:
+            return
+        path = filedialog.askopenfilename(title="Select a file to send")
+        if not path:
+            return
+        self.worker.send_file(path)
+
+    def _disconnect(self):
+        # Deliberately not nulling self.worker: a few in-flight events from
+        # the dying thread (e.g. a last "status") may still be queued, and
+        # their handlers read self.worker.peer_name - an AttributeError
+        # there would raise out of _poll_events and stop it from ever
+        # rescheduling itself, freezing the whole UI. The stale reference
+        # is harmless; _start_worker() overwrites it on the next connect.
+        if self.worker:
+            self.worker.stop()
+        self._chat_shown = False
+        self.chat_frame.pack_forget()
+        self.connect_frame.pack(fill="both", expand=True)
+        self.host_btn.state(["!disabled"])
+        self.connect_btn.state(["!disabled"])
+        self.status_var.set("Disconnected.")
+        self._hide_transfer_bar()
+
+    def _set_chat_input_enabled(self, enabled: bool):
+        state = ["!disabled"] if enabled else ["disabled"]
+        self.msg_entry.state(state)
+        self.send_btn.state(state)
+        self.sendfile_btn.state(state)
+
+    def _update_transfer_bar(self, label: str, done: int, total: int):
+        if not self.transfer_frame.winfo_ismapped():
+            self.transfer_frame.pack(fill="x", pady=(0, 8), before=self.entry_row)
+        percent = int(done / total * 100) if total else 100
+        self.transfer_bar["value"] = percent
+        self.transfer_var.set(
+            f"{label}: {percent}% ({_human_size(done)}/{_human_size(total)})"
+        )
+
+    def _hide_transfer_bar(self):
+        self.transfer_frame.pack_forget()
 
     def _log(self, text: str, tag: str, label: str | None = None):
         self.log.configure(state="normal")
@@ -633,7 +1003,12 @@ class SecureCommsApp(tk.Tk):
         if kind == "identity":
             self.fingerprint_var.set(f"Your identity fingerprint: {ev['fingerprint']}")
         elif kind == "status":
-            self.status_var.set(ev["text"])
+            if self._chat_shown:
+                self._log(ev["text"], "system")
+            else:
+                self.status_var.set(ev["text"])
+        elif kind == "connection_lost":
+            self._set_chat_input_enabled(False)
         elif kind == "error":
             self.status_var.set(ev["text"])
             self.host_btn.state(["!disabled"])
@@ -653,6 +1028,7 @@ class SecureCommsApp(tk.Tk):
             ev["response"]["trusted"] = trusted
             ev["event"].set()
         elif kind == "handshake_done":
+            self._chat_shown = True
             self.status_var.set("Secure channel established.")
             self.header_var.set(
                 f"\U0001f512 Encrypted chat with {self.worker.peer_name}  "
@@ -665,12 +1041,36 @@ class SecureCommsApp(tk.Tk):
                 "Session is now end-to-end encrypted.",
                 "system",
             )
+            self._set_chat_input_enabled(True)
             self.msg_entry.focus_set()
         elif kind == "message":
             self._log(ev["text"], "peer", label=ev["sender"])
             self._notify_incoming(ev["sender"], ev["text"])
         elif kind == "security_alert":
             self._log(f"SECURITY ALERT: {ev['text']}", "alert")
+        elif kind == "file_offer":
+            self._log(
+                f"{self.worker.peer_name} is sending a file: "
+                f"{ev['name']} ({_human_size(ev['size'])})",
+                "system",
+            )
+        elif kind == "file_recv_progress":
+            self._update_transfer_bar(f"Receiving {ev['name']}", ev["received"], ev["total"])
+        elif kind == "file_received":
+            self._hide_transfer_bar()
+            self._log(
+                f"Received file '{ev['name']}' ({_human_size(ev['size'])}) "
+                f"- saved to {ev['path']}",
+                "system",
+            )
+        elif kind == "file_send_progress":
+            self._update_transfer_bar(f"Sending {ev['name']}", ev["sent"], ev["total"])
+        elif kind == "file_sent":
+            self._hide_transfer_bar()
+            self._log(f"Sent file '{ev['name']}' ({_human_size(ev['size'])})", "system")
+        elif kind == "file_send_failed":
+            self._hide_transfer_bar()
+            self._log(f"Failed to send '{ev['name']}': {ev['text']}", "alert")
 
     def _on_close(self):
         if self.worker:
