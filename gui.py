@@ -62,6 +62,7 @@ MSG_FILE_CHUNK = 0x03
 
 FILE_CHUNK_SIZE = 256 * 1024
 MAX_FILE_SIZE = 200 * 1024 * 1024  # sanity cap for this demo app
+MAX_CONCURRENT_INBOUND_TRANSFERS = 4
 
 
 def _human_size(num_bytes: int) -> str:
@@ -294,7 +295,7 @@ class PeerWorker(threading.Thread):
         self.sock = None
         self.channel = None
         self.peer_name = None
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._send_lock = threading.Lock()
         self._srv = None
         self._limiter = None
@@ -323,7 +324,7 @@ class PeerWorker(threading.Thread):
             self.emit("error", text=f"Unexpected error: {e}")
             return
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 if self.role == "host":
                     connected = self._run_host()
@@ -337,7 +338,7 @@ class PeerWorker(threading.Thread):
                 self.emit("error", text=f"Handshake failed: {e}")
                 return
             except (ConnectionError, OSError) as e:
-                if self._stop.is_set():
+                if self._stop_event.is_set():
                     return
                 if not self._reconnect_wait(str(e)):
                     return
@@ -353,16 +354,21 @@ class PeerWorker(threading.Thread):
             self.emit("handshake_done")
             self._recv_loop()
             self._abort_inbound_transfers()
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
             self.channel = None
             self.sock = None
-            if self._stop.is_set():
+            if self._stop_event.is_set():
                 return
             self.emit("connection_lost")
             if not self._reconnect_wait("Connection lost."):
                 return
 
     def _reconnect_wait(self, reason: str) -> bool:
-        """Sleeps out an exponential backoff, checking _stop every 200ms
+        """Sleeps out an exponential backoff, checking _stop_event every 200ms
         so a Disconnect click or window close interrupts it promptly.
         Returns False if stop() fired during (or before) the wait."""
         self._reconnect_attempt += 1
@@ -375,11 +381,11 @@ class PeerWorker(threading.Thread):
         waited = 0.0
         step = 0.2
         while waited < delay:
-            if self._stop.is_set():
+            if self._stop_event.is_set():
                 return False
             time.sleep(step)
             waited += step
-        return not self._stop.is_set()
+        return not self._stop_event.is_set()
 
     @classmethod
     def _compute_backoff_delay(cls, attempt: int) -> float:
@@ -395,7 +401,7 @@ class PeerWorker(threading.Thread):
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((self.host, self.port))
             srv.listen(5)
-            srv.settimeout(0.5)  # lets the accept loop notice self._stop
+            srv.settimeout(0.5)  # lets the accept loop notice self._stop_event
             self._srv = srv
             # Persists across repeated connection attempts on this listen
             # socket (and across reconnects), so a peer who fails the
@@ -407,7 +413,7 @@ class PeerWorker(threading.Thread):
         else:
             self.emit("status", text=f"Waiting for a peer on {self.host}:{self.port}...")
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 conn, addr = self._srv.accept()
             except socket.timeout:
@@ -519,7 +525,7 @@ class PeerWorker(threading.Thread):
         return response.get("trusted", False)
 
     def _recv_loop(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 framed = transport.recv_bytes(self.sock)
             except (ConnectionError, OSError):
@@ -561,6 +567,15 @@ class PeerWorker(threading.Thread):
             self.emit(
                 "security_alert",
                 text=f"Peer offered an oversized file ({_human_size(size)}); refusing.",
+            )
+            return
+        if size <= 0:
+            self.emit("security_alert", text="Peer offered a file with an invalid size.")
+            return
+        if len(self._inbound_transfers) >= MAX_CONCURRENT_INBOUND_TRANSFERS:
+            self.emit(
+                "security_alert",
+                text="Too many simultaneous incoming file transfers; refusing.",
             )
             return
 
@@ -641,13 +656,16 @@ class PeerWorker(threading.Thread):
     def _send_raw(self, plaintext: bytes):
         if self.channel is None or self.sock is None:
             raise ConnectionError("Not connected.")
-        framed = self.channel.encrypt(plaintext)
-        # encrypt() must run before the lock (it mutates ratchet state and
-        # must stay in this caller's order relative to other encrypt()
-        # calls from the same thread); the lock only needs to serialize
-        # the actual socket write against other threads (e.g. a
-        # background file-send) writing to the same socket concurrently.
+        # encrypt() mutates shared ratchet state (send counter, sending
+        # chain, and possibly a rekey step) - two threads calling it
+        # concurrently (e.g. a text send from the GUI thread racing a
+        # background file-send) could read the same counter or tear a
+        # rekey step in half, which breaks AES-GCM's nonce-uniqueness
+        # guarantee. So encrypt() has to be inside the lock too, not just
+        # the socket write; this also keeps wire order matching counter
+        # order for free.
         with self._send_lock:
+            framed = self.channel.encrypt(plaintext)
             transport.send_bytes(self.sock, framed)
 
     def send(self, text: str):
@@ -701,7 +719,7 @@ class PeerWorker(threading.Thread):
         self.emit("file_sent", name=path.name, size=size)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         # Plain close() from this (GUI) thread does not reliably unblock a
         # recv() the worker thread is blocked in on the same socket - the
         # kernel won't tear the connection down (and send the peer a FIN)
@@ -1009,6 +1027,7 @@ class SecureCommsApp(tk.Tk):
                 self.status_var.set(ev["text"])
         elif kind == "connection_lost":
             self._set_chat_input_enabled(False)
+            self._hide_transfer_bar()
         elif kind == "error":
             self.status_var.set(ev["text"])
             self.host_btn.state(["!disabled"])

@@ -13,6 +13,7 @@ Run with:  python3 -m pytest test_gui_peerworker_integration.py -v
 
 import queue
 import socket
+import sys
 import threading
 import time
 
@@ -148,3 +149,74 @@ def test_end_to_end_handshake_chat_file_transfer_and_reconnect(tmp_path, monkeyp
         host_worker.stop()
         connect_worker.join(timeout=5)
         host_worker.join(timeout=5)
+
+
+def test_concurrent_sends_do_not_corrupt_the_channel(tmp_path, monkeypatch):
+    """Regression test: SecureChannel.encrypt() mutates shared ratchet state
+    (send counter, sending chain, and possibly a rekey step), so concurrent
+    callers on different threads (e.g. a text send racing a background
+    file-send) MUST be serialized around encrypt() itself, not just the
+    socket write - otherwise two threads can grab the same counter, which
+    reuses an AES-GCM nonce, or tear a rekey step in half and desync the
+    peer. Drives many concurrent send() calls from separate threads and
+    checks every message arrives exactly once, undamaged."""
+    monkeypatch.setattr(gui, "FILE_RECV_DIR", tmp_path / "received")
+    monkeypatch.setattr(gui, "KEY_DIR", str(tmp_path / "keys"))
+    # A shorter GIL switch interval makes CPython swap threads far more
+    # often, which is what actually makes this race land reliably instead
+    # of only once in a while.
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    port = _free_port()
+    host_worker = gui.PeerWorker("bob2", "host", "127.0.0.1", port, queue.Queue())
+    connect_worker = gui.PeerWorker("alice2", "connect", "127.0.0.1", port, queue.Queue())
+
+    host_seen, connect_seen = [], []
+    _start_event_pump(host_worker, host_seen)
+    _start_event_pump(connect_worker, connect_seen)
+
+    try:
+        host_worker.start()
+        assert _wait_for(lambda: host_worker._srv is not None, timeout=5)
+        connect_worker.start()
+        assert _wait_for(
+            lambda: host_worker.channel is not None and connect_worker.channel is not None,
+            timeout=10,
+        )
+
+        n = 60
+        # A barrier makes every thread call send() as close to
+        # simultaneously as possible, which is what actually exercises the
+        # race instead of threads trickling in one at a time.
+        barrier = threading.Barrier(n)
+
+        def _send(i):
+            barrier.wait()
+            connect_worker.send(f"msg-{i}")
+
+        threads = [threading.Thread(target=_send, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert _wait_for(
+            lambda: sum(1 for e in host_seen if e["kind"] == "message") >= n, timeout=10
+        ), f"only received {sum(1 for e in host_seen if e['kind'] == 'message')}/{n} messages"
+
+        received_texts = [e["text"] for e in host_seen if e["kind"] == "message"]
+        assert len(received_texts) == n, (
+            f"expected exactly {n} messages, got {len(received_texts)} "
+            "(a race would show up as duplicates or drops)"
+        )
+        assert set(received_texts) == {f"msg-{i}" for i in range(n)}
+        assert not any(e["kind"] in ("security_alert",) for e in host_seen), (
+            "a torn/duplicated counter would surface as a tamper/replay alert"
+        )
+    finally:
+        connect_worker.stop()
+        host_worker.stop()
+        connect_worker.join(timeout=5)
+        host_worker.join(timeout=5)
+        sys.setswitchinterval(old_interval)

@@ -126,6 +126,32 @@ def test_oversized_file_offer_is_refused(tmp_path, monkeypatch):
     assert worker._inbound_transfers == {}
 
 
+def test_zero_size_file_offer_is_refused(tmp_path, monkeypatch):
+    worker = make_worker(tmp_path, monkeypatch)
+    worker._handle_plaintext(gui._encode_file_offer(b"0123456789abcdef", "empty.bin", 0, "deadbeef"))
+
+    events = drain(worker)
+    assert events == [{"kind": "security_alert", "text": "Peer offered a file with an invalid size."}]
+    assert worker._inbound_transfers == {}
+
+
+def test_too_many_concurrent_inbound_transfers_is_refused(tmp_path, monkeypatch):
+    worker = make_worker(tmp_path, monkeypatch)
+    for i in range(gui.MAX_CONCURRENT_INBOUND_TRANSFERS):
+        file_id = bytes([i]) * 16
+        worker._handle_plaintext(gui._encode_file_offer(file_id, f"f{i}.bin", 1000, "deadbeef"))
+    assert len(worker._inbound_transfers) == gui.MAX_CONCURRENT_INBOUND_TRANSFERS
+    drain(worker)
+
+    one_too_many = bytes([99]) * 16
+    worker._handle_plaintext(gui._encode_file_offer(one_too_many, "overflow.bin", 1000, "deadbeef"))
+
+    events = drain(worker)
+    assert events == [{"kind": "security_alert", "text": "Too many simultaneous incoming file transfers; refusing."}]
+    assert one_too_many not in worker._inbound_transfers
+    assert len(worker._inbound_transfers) == gui.MAX_CONCURRENT_INBOUND_TRANSFERS
+
+
 def test_chunk_with_no_matching_offer_is_dropped_silently(tmp_path, monkeypatch):
     worker = make_worker(tmp_path, monkeypatch)
     worker._handle_plaintext(gui._encode_file_chunk(b"0123456789abcdef", b"stray data"))
