@@ -275,6 +275,11 @@ class PeerWorker(threading.Thread):
 
     RECONNECT_BASE_DELAY = 1.0
     RECONNECT_MAX_DELAY = 30.0
+    # A stalled peer (connects, then sends nothing) must not hang the
+    # worker thread forever - especially on the host side, where the
+    # listening socket is now persistent across reconnects, so a single
+    # stuck peer would otherwise block every later peer indefinitely.
+    HANDSHAKE_TIMEOUT = 15.0
 
     def __init__(
         self,
@@ -431,6 +436,7 @@ class PeerWorker(threading.Thread):
                 continue
 
             self.sock = conn
+            conn.settimeout(self.HANDSHAKE_TIMEOUT)
             self.emit("status", text=f"Connection from {addr[0]}:{addr[1]}")
 
             try:
@@ -440,7 +446,7 @@ class PeerWorker(threading.Thread):
                 transport.send_json(self.sock, msg2.to_wire())
                 msg3 = HandshakeMessage3.from_wire(transport.recv_json(self.sock))
                 self.channel = responder_finish(self.trust_store, state, msg3)
-            except HandshakeError as e:
+            except (HandshakeError, TimeoutError) as e:
                 self._limiter.record_failure(ip)
                 self.emit(
                     "status",
@@ -453,6 +459,7 @@ class PeerWorker(threading.Thread):
                 self.sock = None
                 continue
 
+            conn.settimeout(None)
             self._limiter.record_success(ip)
             return True
 
@@ -461,9 +468,11 @@ class PeerWorker(threading.Thread):
     def _run_connect(self) -> bool:
         self.emit("status", text=f"Connecting to {self.host}:{self.port}...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10.0)
+        # Kept through the handshake reads below, not just connect() - a
+        # peer that accepts the TCP connection and then sends nothing
+        # must not hang this thread forever either.
+        sock.settimeout(self.HANDSHAKE_TIMEOUT)
         sock.connect((self.host, self.port))
-        sock.settimeout(None)
         self.sock = sock
         self.emit("status", text="Connected. Starting handshake...")
 
@@ -476,6 +485,7 @@ class PeerWorker(threading.Thread):
             self.identity, self.trust_store, state, msg2
         )
         transport.send_json(self.sock, msg3.to_wire())
+        sock.settimeout(None)
         return True
 
     def _exchange_identity_and_pin(self):
@@ -610,7 +620,24 @@ class PeerWorker(threading.Thread):
             # got abandoned on reconnect. Drop it rather than crash.
             return
 
-        transfer["handle"].write(data)
+        try:
+            transfer["handle"].write(data)
+        except OSError as e:
+            # A full disk or similar must be reported and cleaned up here,
+            # not left to propagate up into run()'s network-error handler
+            # (where it would be misreported as a dropped connection and
+            # leave this handle/partial file behind).
+            del self._inbound_transfers[file_id]
+            try:
+                transfer["handle"].close()
+            except OSError:
+                pass
+            try:
+                transfer["path"].unlink()
+            except OSError:
+                pass
+            self.emit("error", text=f"Can't write incoming file: {e}")
+            return
         transfer["digest"].update(data)
         transfer["received"] += len(data)
         self.emit(
@@ -691,6 +718,11 @@ class PeerWorker(threading.Thread):
                 f"{_human_size(MAX_FILE_SIZE)}",
             )
             return
+        if size <= 0:
+            self.emit(
+                "file_send_failed", name=path.name, text="file is empty; nothing to send"
+            )
+            return
 
         digest = hashlib.sha256()
         try:
@@ -702,11 +734,22 @@ class PeerWorker(threading.Thread):
             return
 
         file_id = uuid.uuid4().bytes
+        # A reconnect mid-transfer swaps in a brand-new SecureChannel with
+        # no memory of this offer, so blindly continuing to send chunks
+        # under the old file_id would just have the receiver silently
+        # drop every one of them (no matching offer) while this thread
+        # still reports success. Pin to the channel that was live when the
+        # transfer started and bail out the moment it changes.
+        session = self.channel
         try:
+            if self.channel is not session:
+                raise ConnectionError("connection was lost before the transfer started")
             self._send_raw(_encode_file_offer(file_id, path.name, size, digest.hexdigest()))
             sent = 0
             with open(path, "rb") as f:
                 for chunk in iter(lambda: f.read(FILE_CHUNK_SIZE), b""):
+                    if self.channel is not session:
+                        raise ConnectionError("connection was lost mid-transfer")
                     self._send_raw(_encode_file_chunk(file_id, chunk))
                     sent += len(chunk)
                     self.emit(
@@ -720,6 +763,12 @@ class PeerWorker(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+        # Snapshot the references once: the worker thread clears self.sock
+        # (and, less often, self._srv) on every connection loss, so
+        # re-reading the attribute between an "if" check and the call
+        # below would race into "NoneType has no attribute shutdown".
+        sock = self.sock
+        srv = self._srv
         # Plain close() from this (GUI) thread does not reliably unblock a
         # recv() the worker thread is blocked in on the same socket - the
         # kernel won't tear the connection down (and send the peer a FIN)
@@ -728,18 +777,18 @@ class PeerWorker(threading.Thread):
         # forces it immediately regardless of what other threads are
         # doing with the socket.
         try:
-            if self.sock:
-                self.sock.shutdown(socket.SHUT_RDWR)
+            if sock:
+                sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
         try:
-            if self.sock:
-                self.sock.close()
+            if sock:
+                sock.close()
         except OSError:
             pass
         try:
-            if self._srv:
-                self._srv.close()
+            if srv:
+                srv.close()
         except OSError:
             pass
 

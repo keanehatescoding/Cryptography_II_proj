@@ -151,6 +151,8 @@ def test_too_many_concurrent_inbound_transfers_is_refused(tmp_path, monkeypatch)
     assert one_too_many not in worker._inbound_transfers
     assert len(worker._inbound_transfers) == gui.MAX_CONCURRENT_INBOUND_TRANSFERS
 
+    worker._abort_inbound_transfers()  # close the handles this test opened
+
 
 def test_chunk_with_no_matching_offer_is_dropped_silently(tmp_path, monkeypatch):
     worker = make_worker(tmp_path, monkeypatch)
@@ -196,3 +198,74 @@ def test_backoff_delay_grows_and_caps():
     assert gui.PeerWorker._compute_backoff_delay(5) == 16.0
     assert gui.PeerWorker._compute_backoff_delay(6) == 30.0  # capped
     assert gui.PeerWorker._compute_backoff_delay(20) == 30.0
+
+
+# -- outbound send-side guards --------------------------------------------
+
+
+def test_send_file_rejects_empty_file(tmp_path, monkeypatch):
+    worker = make_worker(tmp_path, monkeypatch)
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+
+    worker._send_file(str(empty))
+
+    events = drain(worker)
+    assert events == [
+        {"kind": "file_send_failed", "name": "empty.bin", "text": "file is empty; nothing to send"}
+    ]
+
+
+def test_send_file_aborts_if_channel_is_replaced_mid_transfer(tmp_path, monkeypatch):
+    """Regression test: a reconnect mid-transfer swaps in a brand-new
+    SecureChannel that has no memory of the in-flight offer. Without the
+    identity check, the sending thread would keep pushing chunks under
+    the stale file_id - the receiver drops every one (no matching offer)
+    while the sender still reports "Sent file". _send_file must notice
+    the swap and abort instead."""
+    monkeypatch.setattr(gui, "FILE_RECV_DIR", tmp_path)
+    monkeypatch.setattr(gui, "FILE_CHUNK_SIZE", 10)
+    worker = gui.PeerWorker("alice", "connect", "127.0.0.1", 8000, queue.Queue())
+    worker.sock = object()  # truthy stand-in; _send_raw is faked out below
+    worker.channel = object()  # the "live" channel session starts with
+
+    calls = []
+
+    def fake_send_raw(plaintext):
+        calls.append(plaintext)
+        if len(calls) == 2:  # right after the offer + first chunk went out
+            worker.channel = object()  # simulate a reconnect swapping channels
+
+    monkeypatch.setattr(worker, "_send_raw", fake_send_raw)
+
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"x" * 55)  # 55 bytes / 10-byte chunks = 6 chunks total
+
+    worker._send_file(str(payload))
+
+    assert len(calls) == 2, "must stop right after noticing the channel changed"
+    events = drain(worker)
+    assert events[-1]["kind"] == "file_send_failed"
+    assert "lost" in events[-1]["text"]
+
+
+# -- inbound disk-write failure --------------------------------------------
+
+
+def test_chunk_write_failure_cleans_up_and_reports_error(tmp_path, monkeypatch):
+    worker = make_worker(tmp_path, monkeypatch)
+    file_id = b"0123456789abcdef"
+    worker._handle_plaintext(gui._encode_file_offer(file_id, "note.txt", 1000, "deadbeef"))
+    drain(worker)
+
+    def broken_write(data):
+        raise OSError("No space left on device")
+
+    worker._inbound_transfers[file_id]["handle"].write = broken_write
+
+    worker._handle_plaintext(gui._encode_file_chunk(file_id, b"some data"))
+
+    events = drain(worker)
+    assert events == [{"kind": "error", "text": "Can't write incoming file: No space left on device"}]
+    assert file_id not in worker._inbound_transfers
+    assert not (tmp_path / "note.txt").exists()

@@ -166,17 +166,19 @@ def test_concurrent_sends_do_not_corrupt_the_channel(tmp_path, monkeypatch):
     # often, which is what actually makes this race land reliably instead
     # of only once in a while.
     old_interval = sys.getswitchinterval()
-    sys.setswitchinterval(1e-6)
-
-    port = _free_port()
-    host_worker = gui.PeerWorker("bob2", "host", "127.0.0.1", port, queue.Queue())
-    connect_worker = gui.PeerWorker("alice2", "connect", "127.0.0.1", port, queue.Queue())
-
-    host_seen, connect_seen = [], []
-    _start_event_pump(host_worker, host_seen)
-    _start_event_pump(connect_worker, connect_seen)
+    host_worker = connect_worker = None
 
     try:
+        sys.setswitchinterval(1e-6)
+
+        port = _free_port()
+        host_worker = gui.PeerWorker("bob2", "host", "127.0.0.1", port, queue.Queue())
+        connect_worker = gui.PeerWorker("alice2", "connect", "127.0.0.1", port, queue.Queue())
+
+        host_seen, connect_seen = [], []
+        _start_event_pump(host_worker, host_seen)
+        _start_event_pump(connect_worker, connect_seen)
+
         host_worker.start()
         assert _wait_for(lambda: host_worker._srv is not None, timeout=5)
         connect_worker.start()
@@ -200,6 +202,9 @@ def test_concurrent_sends_do_not_corrupt_the_channel(tmp_path, monkeypatch):
             t.start()
         for t in threads:
             t.join(timeout=5)
+        assert not any(t.is_alive() for t in threads), (
+            "a sender thread didn't finish within the join timeout"
+        )
 
         assert _wait_for(
             lambda: sum(1 for e in host_seen if e["kind"] == "message") >= n, timeout=10
@@ -215,8 +220,62 @@ def test_concurrent_sends_do_not_corrupt_the_channel(tmp_path, monkeypatch):
             "a torn/duplicated counter would surface as a tamper/replay alert"
         )
     finally:
-        connect_worker.stop()
-        host_worker.stop()
-        connect_worker.join(timeout=5)
-        host_worker.join(timeout=5)
+        if connect_worker is not None:
+            connect_worker.stop()
+        if host_worker is not None:
+            host_worker.stop()
+        if connect_worker is not None:
+            connect_worker.join(timeout=5)
+        if host_worker is not None:
+            host_worker.join(timeout=5)
         sys.setswitchinterval(old_interval)
+
+
+def test_stalled_peer_does_not_block_later_peers(tmp_path, monkeypatch):
+    """Regression test: the host's listening socket is now persistent
+    across reconnects (see PeerWorker docstring), so a peer that opens
+    the TCP connection and then sends nothing must time out instead of
+    hanging the worker thread forever - otherwise every later peer would
+    be blocked out indefinitely by one stalled connection."""
+    monkeypatch.setattr(gui, "FILE_RECV_DIR", tmp_path / "received")
+    monkeypatch.setattr(gui, "KEY_DIR", str(tmp_path / "keys"))
+    monkeypatch.setattr(gui.PeerWorker, "HANDSHAKE_TIMEOUT", 0.5)
+
+    port = _free_port()
+    host_worker = gui.PeerWorker("bob3", "host", "127.0.0.1", port, queue.Queue())
+    host_seen = []
+    _start_event_pump(host_worker, host_seen)
+
+    try:
+        host_worker.start()
+        assert _wait_for(lambda: host_worker._srv is not None, timeout=5)
+
+        # Connects but never speaks - the old behavior hung the worker
+        # thread here forever.
+        stalled = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        stalled.connect(("127.0.0.1", port))
+        assert _wait_for(
+            lambda: any(
+                e["kind"] == "status" and "Waiting for next peer" in e.get("text", "")
+                for e in host_seen
+            ),
+            timeout=5,
+        ), "stalled peer's handshake never timed out"
+        stalled.close()
+
+        # A real peer must still be able to connect afterward - proves
+        # the accept loop wasn't left permanently stuck on the first one.
+        connect_worker = gui.PeerWorker("alice3", "connect", "127.0.0.1", port, queue.Queue())
+        _start_event_pump(connect_worker, [])
+        connect_worker.start()
+        try:
+            assert _wait_for(
+                lambda: host_worker.channel is not None and connect_worker.channel is not None,
+                timeout=10,
+            ), "a real peer couldn't connect after the stalled one timed out"
+        finally:
+            connect_worker.stop()
+            connect_worker.join(timeout=5)
+    finally:
+        host_worker.stop()
+        host_worker.join(timeout=5)
