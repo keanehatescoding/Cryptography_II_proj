@@ -141,8 +141,16 @@ are identical either way.
 
 ```bash
 pip install cryptography pytest
-python3 -m pytest test_secure_comms.py -v
+python3 -m pytest -v
 ```
+
+`test_secure_comms.py` covers the crypto/protocol modules (see below).
+`test_gui_file_transfer.py` and `test_gui_peerworker_integration.py`
+cover `gui.py`'s file-transfer framing and its reconnect-with-backoff
+loop - the latter drives two real `PeerWorker`s over real loopback TCP
+sockets (no Tk widgets involved) through a handshake, a multi-chunk file
+transfer, and a simulated dropped connection to confirm both sides
+reconnect and resume chatting.
 
 19 tests cover: successful handshake, bidirectional messaging, tampered
 ciphertext rejection, replay rejection, sliding-window reordering
@@ -240,6 +248,29 @@ or unlocks an existing encrypted one - leave it blank for a brand-new
 unencrypted identity. A wrong passphrase surfaces as a plain error
 dialog rather than crashing the app.
 
+**File transfer**: the "Send File…" button sends any local file through
+the same encrypted channel as chat messages. Large files are split into
+256 KiB plaintext chunks (each independently ratchet-encrypted, so the
+usual forward-secrecy/authentication properties apply per chunk); a
+SHA-256 of the whole file is sent up front and checked against the
+reassembled file on completion, and a mismatch discards the partial file
+with a security alert instead of silently saving corrupted data.
+Received files are saved under `./received_files/`, deduplicated by
+appending `(1)`, `(2)`, ... on a name collision. There's a 200 MiB cap
+per file for this demo app, and a progress bar tracks the active
+transfer in either direction.
+
+**Automatic reconnect**: a dropped TCP connection no longer ends the
+session outright. The initiating ("Connect") side keeps redialing the
+peer with exponential backoff (1s, 2s, 4s, ... capped at 30s); the
+listening ("Host") side goes back to accepting new connections on the
+same socket. Either way, reconnecting performs a brand-new 3-message
+handshake - there is no session resumption, so a reconnect starts a
+fresh ratchet chain exactly like manually restarting would. A "Send" /
+"Send File" input is disabled while disconnected and re-enabled once the
+new handshake completes; a "Disconnect" button in the chat view stops
+the retry loop and returns to the connect screen.
+
 ## What this is _not_
 
 - Not a full PKI (see: mini-CA + certificate validation as a separate
@@ -260,9 +291,13 @@ dialog rather than crashing the app.
   couple of rekey boundaries will fail to decrypt with a clear error
   rather than silently succeeding - a deliberate bounded-memory
   trade-off, not a bug.
-- No reconnect/resumption - a dropped TCP connection ends the session
-  and requires a fresh handshake (which does start an entirely new,
-  uncompromised ratchet chain, since it derives from a new ephemeral
-  X25519 exchange).
+- No session resumption - the GUI's automatic reconnect (see "Running
+  the GUI" above) retries the underlying TCP connection, but each
+  successful reconnect still performs a brand-new 3-message handshake
+  and starts an entirely new, uncompromised ratchet chain rather than
+  resuming the old one. Any file transfer in flight when the connection
+  drops is abandoned, not resumed. `server.py`/`client.py` (the terminal
+  demo) don't reconnect at all - a dropped connection there still ends
+  the session outright.
 - Encrypting the identity key at rest protects against a stolen disk,
   not against malware running as the same user while the app is open.
