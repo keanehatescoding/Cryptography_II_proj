@@ -85,6 +85,36 @@ def _encode_file_chunk(file_id: bytes, chunk: bytes) -> bytes:
     return bytes([MSG_FILE_CHUNK]) + file_id + chunk
 
 
+# Turns the 8-byte hex fingerprint (identity.py's fingerprint_for_bytes)
+# into a spoken phrase for out-of-band verification - reading "brave-falcon
+# calm-opal ..." aloud over a call is far less error-prone than reading
+# hex nibbles one at a time, the same problem Signal's word-based safety
+# numbers and the classic PGP word list solve. This is presentation only:
+# each byte maps deterministically to one adjective-noun pair (high nibble
+# picks the adjective, low nibble the noun), so the 16 adjectives and 16
+# nouns below are guaranteed to produce 256 distinct pairs by construction
+# - no risk of an accidental duplicate the way a hand-authored 256-word
+# list would have. The underlying hex fingerprint stays the identity's
+# real form everywhere else (TrustStore, CLI, audit log); this is purely
+# an alternate rendering of it for the GUI.
+_FINGERPRINT_ADJECTIVES = [
+    "amber", "brave", "calm", "dusty", "eager", "fuzzy", "giant", "hollow",
+    "icy", "jolly", "keen", "lucky", "misty", "noble", "olive", "proud",
+]
+_FINGERPRINT_NOUNS = [
+    "anchor", "badger", "cactus", "delta", "ember", "falcon", "granite", "harbor",
+    "ivory", "jasper", "kestrel", "lagoon", "meadow", "nectar", "opal", "pepper",
+]
+
+
+def _fingerprint_to_words(hex_fingerprint: str) -> str:
+    raw = bytes.fromhex(hex_fingerprint.replace(":", ""))
+    words = (
+        f"{_FINGERPRINT_ADJECTIVES[b >> 4]}-{_FINGERPRINT_NOUNS[b & 0x0F]}" for b in raw
+    )
+    return " ".join(words)
+
+
 def _unique_dest_path(directory: Path, name: str) -> Path:
     """Picks a non-colliding path under `directory` for an incoming file.
 
@@ -892,7 +922,13 @@ class SecureCommsApp(tk.Tk):
         ).pack(pady=8, fill="x")
 
         self.fingerprint_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.fingerprint_var, font=("Courier", 10)).pack()
+        ttk.Label(
+            frame,
+            textvariable=self.fingerprint_var,
+            font=("Courier", 10),
+            wraplength=480,
+            justify="center",
+        ).pack()
 
     def _build_chat_frame(self):
         frame = ttk.Frame(self, padding=12)
@@ -1068,7 +1104,10 @@ class SecureCommsApp(tk.Tk):
     def _handle_event(self, ev: dict):
         kind = ev["kind"]
         if kind == "identity":
-            self.fingerprint_var.set(f"Your identity fingerprint: {ev['fingerprint']}")
+            self.fingerprint_var.set(
+                f"Your identity fingerprint: {ev['fingerprint']}\n"
+                f"({_fingerprint_to_words(ev['fingerprint'])})"
+            )
         elif kind == "status":
             if self._chat_shown:
                 self._log(ev["text"], "system")
@@ -1086,7 +1125,8 @@ class SecureCommsApp(tk.Tk):
             trusted = messagebox.askyesno(
                 "Verify new identity",
                 f"'{ev['name']}' is presenting identity fingerprint:\n\n"
-                f"    {ev['fingerprint']}\n\n"
+                f"    {ev['fingerprint']}\n"
+                f"    ({_fingerprint_to_words(ev['fingerprint'])})\n\n"
                 f"This is a Trust-On-First-Use pin, like an SSH host key. "
                 f"Ideally you'd confirm this fingerprint with '{ev['name']}' "
                 f"over a separate channel (phone call, in person) before "
