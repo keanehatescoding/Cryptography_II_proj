@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
@@ -113,6 +114,20 @@ def hkdf(shared_secret: bytes, salt: bytes, info: bytes, length: int = 32) -> by
         salt=salt,
         info=info,
     ).derive(shared_secret)
+
+
+def derive_key_from_passphrase(passphrase: str, salt: bytes, length: int = 32) -> bytes:
+    """Scrypt, not HKDF: HKDF assumes its input is already high-entropy
+    (an ECDH shared secret, say) and does nothing to slow an attacker down.
+    A human passphrase is comparatively low-entropy and guessable, so it
+    needs a deliberately slow, memory-hard KDF instead - scrypt's memory
+    cost also resists cheap parallel brute-forcing on GPUs/ASICs the way a
+    plain slow hash wouldn't. Parameters are scrypt's RFC 7914 "interactive
+    logins" profile (n=2**14, r=8, p=1): expensive enough to matter, cheap
+    enough not to make opening the app noticeably slow."""
+    return Scrypt(salt=salt, length=length, n=2**14, r=8, p=1).derive(
+        passphrase.encode("utf-8")
+    )
 
 
 # ---------------------------------------------------------------------------

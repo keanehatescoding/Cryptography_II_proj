@@ -25,6 +25,7 @@ from handshake import (
     HandshakeMessage2,
 )
 from secure_channel import ReplayError, SecureChannel, TamperError
+import history
 
 
 def do_handshake(
@@ -766,6 +767,86 @@ def test_secure_channel_padding_can_be_disabled():
     assert len(ct_short) != len(ct_long)
     assert bob_channel.decrypt(ct_short) == b"hi"
     assert bob_channel.decrypt(ct_long) == b"a fairly different length message"
+
+
+def test_history_requires_a_passphrase(tmp_path):
+    with pytest.raises(history.HistoryUnavailable):
+        history.EncryptedHistory.load("alice", str(tmp_path), passphrase=None)
+    with pytest.raises(history.HistoryUnavailable):
+        history.EncryptedHistory.load("alice", str(tmp_path), passphrase="")
+
+
+def test_history_starts_empty_for_a_new_identity(tmp_path):
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    assert h.for_peer("bob") == []
+
+
+def test_history_append_and_reload_roundtrips(tmp_path):
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    h.append("bob", "sent", "hey bob")
+    h.append("bob", "received", "hey alice")
+
+    reloaded = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    entries = reloaded.for_peer("bob")
+    assert [e["direction"] for e in entries] == ["sent", "received"]
+    assert [e["text"] for e in entries] == ["hey bob", "hey alice"]
+    assert all(isinstance(e["ts"], (int, float)) for e in entries)
+
+
+def test_history_wrong_passphrase_is_rejected(tmp_path):
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="correct-horse")
+    h.append("bob", "sent", "secret plans")
+
+    with pytest.raises(ValueError):
+        history.EncryptedHistory.load("alice", str(tmp_path), passphrase="wrong-guess")
+
+
+def test_history_corrupted_file_is_rejected(tmp_path):
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    h.append("bob", "sent", "hi")
+
+    path = tmp_path / "alice_history.enc"
+    raw = bytearray(path.read_bytes())
+    raw[-1] ^= 0xFF  # flip a bit in the GCM tag
+    path.write_bytes(bytes(raw))
+
+    with pytest.raises(ValueError):
+        history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+
+
+def test_history_for_peer_filters_correctly(tmp_path):
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    h.append("bob", "sent", "hi bob")
+    h.append("carol", "sent", "hi carol")
+    h.append("bob", "received", "hi alice")
+
+    assert [e["text"] for e in h.for_peer("bob")] == ["hi bob", "hi alice"]
+    assert [e["text"] for e in h.for_peer("carol")] == ["hi carol"]
+    assert h.for_peer("dave") == []
+
+
+def test_history_file_does_not_contain_plaintext_on_disk(tmp_path):
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    secret_text = "the eagle flies at midnight"
+    h.append("bob", "sent", secret_text)
+
+    raw = (tmp_path / "alice_history.enc").read_bytes()
+    assert secret_text.encode("utf-8") not in raw
+    assert b"bob" not in raw
+
+
+def test_history_file_cannot_be_loaded_under_a_different_identity_name(tmp_path):
+    """The AAD binds ciphertext to the identity name, so copying a
+    history file into a different identity's slot (even with the same
+    passphrase) must fail closed rather than silently decrypting."""
+    h = history.EncryptedHistory.load("alice", str(tmp_path), passphrase="hunter2")
+    h.append("bob", "sent", "hi")
+
+    (tmp_path / "mallory_history.enc").write_bytes(
+        (tmp_path / "alice_history.enc").read_bytes()
+    )
+    with pytest.raises(ValueError):
+        history.EncryptedHistory.load("mallory", str(tmp_path), passphrase="hunter2")
 
 
 if __name__ == "__main__":

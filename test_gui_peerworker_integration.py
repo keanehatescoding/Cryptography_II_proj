@@ -279,3 +279,92 @@ def test_stalled_peer_does_not_block_later_peers(tmp_path, monkeypatch):
     finally:
         host_worker.stop()
         host_worker.join(timeout=5)
+
+
+def test_history_persists_across_a_restart_and_replays_for_the_same_peer(tmp_path, monkeypatch):
+    """End-to-end: two real PeerWorkers, real handshake, real chat, with
+    save_history=True on both sides. Stop them, start a brand-new pair of
+    workers under the same names/passphrases (simulating the app being
+    closed and reopened), and confirm the prior conversation comes back
+    via a history_loaded event - scoped to the right peer."""
+    monkeypatch.setattr(gui, "FILE_RECV_DIR", tmp_path / "received")
+    monkeypatch.setattr(gui, "KEY_DIR", str(tmp_path / "keys"))
+
+    def run_session(port, host_events=None, connect_events=None):
+        host_events = host_events if host_events is not None else []
+        connect_events = connect_events if connect_events is not None else []
+        host_worker = gui.PeerWorker(
+            "bob4", "host", "127.0.0.1", port, queue.Queue(),
+            passphrase="hunter2", save_history=True,
+        )
+        connect_worker = gui.PeerWorker(
+            "alice4", "connect", "127.0.0.1", port, queue.Queue(),
+            passphrase="hunter2", save_history=True,
+        )
+        _start_event_pump(host_worker, host_events)
+        _start_event_pump(connect_worker, connect_events)
+        host_worker.start()
+        assert _wait_for(lambda: host_worker._srv is not None, timeout=5)
+        connect_worker.start()
+        # Wait for handshake_done specifically (not just channel being
+        # set): history_loaded is emitted strictly before handshake_done,
+        # so once handshake_done has actually landed in the collected
+        # events list, history_loaded is guaranteed to already be there
+        # too - checking channel directly races the event-pump thread.
+        assert _wait_for(
+            lambda: any(e["kind"] == "handshake_done" for e in host_events)
+            and any(e["kind"] == "handshake_done" for e in connect_events),
+            timeout=10,
+        )
+        return host_worker, connect_worker, host_events, connect_events
+
+    port = _free_port()
+    host1, connect1, host1_events, connect1_events = run_session(port)
+    try:
+        connect1.send("hello from session one")
+        assert _wait_for(
+            lambda: any(
+                e["kind"] == "message" and e.get("text") == "hello from session one"
+                for e in host1_events
+            ),
+            timeout=5,
+        )
+        host1.send("got it, bob here")
+        assert _wait_for(
+            lambda: any(
+                e["kind"] == "message" and e.get("text") == "got it, bob here"
+                for e in connect1_events
+            ),
+            timeout=5,
+        )
+    finally:
+        connect1.stop()
+        host1.stop()
+        connect1.join(timeout=5)
+        host1.join(timeout=5)
+
+    # A fresh pair of workers, same identities/passphrases, different port
+    # (simulates closing and reopening the app) - history must survive.
+    port2 = _free_port()
+    host2, connect2, host2_events, connect2_events = run_session(port2)
+    try:
+        host2_history = [e for e in host2_events if e["kind"] == "history_loaded"]
+        connect2_history = [e for e in connect2_events if e["kind"] == "history_loaded"]
+        assert len(host2_history) == 1
+        assert len(connect2_history) == 1
+
+        host_texts = [(e["direction"], e["text"]) for e in host2_history[0]["entries"]]
+        connect_texts = [(e["direction"], e["text"]) for e in connect2_history[0]["entries"]]
+        assert host_texts == [
+            ("received", "hello from session one"),
+            ("sent", "got it, bob here"),
+        ]
+        assert connect_texts == [
+            ("sent", "hello from session one"),
+            ("received", "got it, bob here"),
+        ]
+    finally:
+        connect2.stop()
+        host2.stop()
+        connect2.join(timeout=5)
+        host2.join(timeout=5)

@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import history
 import transport
 from handshake import (
     HandshakeError,
@@ -319,6 +320,7 @@ class PeerWorker(threading.Thread):
         port: int,
         events: queue.Queue,
         passphrase: str = None,
+        save_history: bool = False,
     ):
         super().__init__(daemon=True)
         self.name = name
@@ -327,6 +329,8 @@ class PeerWorker(threading.Thread):
         self.port = port
         self.events = events
         self.passphrase = passphrase or None
+        self.save_history = save_history
+        self.history = None
         self.sock = None
         self.channel = None
         self.peer_name = None
@@ -336,6 +340,7 @@ class PeerWorker(threading.Thread):
         self._limiter = None
         self._reconnect_attempt = 0
         self._inbound_transfers = {}
+        self._history_shown = False
 
     def emit(self, kind, **kwargs):
         self.events.put({"kind": kind, **kwargs})
@@ -358,6 +363,15 @@ class PeerWorker(threading.Thread):
         except Exception as e:  # noqa: BLE001 - surface anything unexpected to the UI
             self.emit("error", text=f"Unexpected error: {e}")
             return
+
+        if self.save_history:
+            try:
+                self.history = history.EncryptedHistory.load(
+                    self.name, KEY_DIR, self.passphrase
+                )
+            except (ValueError, history.HistoryUnavailable) as e:
+                self.emit("error", text=str(e))
+                return
 
         while not self._stop_event.is_set():
             try:
@@ -386,6 +400,13 @@ class PeerWorker(threading.Thread):
                 return  # stop() was set before a handshake ever completed
 
             self._reconnect_attempt = 0
+            # Only replay history once per worker lifetime, not on every
+            # reconnect - the chat log already has it on screen from the
+            # first time, and re-dumping it on each auto-reconnect would
+            # just duplicate it.
+            if self.history is not None and not self._history_shown:
+                self._history_shown = True
+                self.emit("history_loaded", entries=self.history.for_peer(self.peer_name))
             self.emit("handshake_done")
             self._recv_loop()
             self._abort_inbound_transfers()
@@ -582,9 +603,10 @@ class PeerWorker(threading.Thread):
             return
         msg_type, body = plaintext[0], plaintext[1:]
         if msg_type == MSG_TEXT:
-            self.emit(
-                "message", sender=self.peer_name, text=body.decode("utf-8", "replace")
-            )
+            text = body.decode("utf-8", "replace")
+            if self.history is not None:
+                self.history.append(self.peer_name, "received", text)
+            self.emit("message", sender=self.peer_name, text=text)
         elif msg_type == MSG_FILE_OFFER:
             self._handle_file_offer(body)
         elif msg_type == MSG_FILE_CHUNK:
@@ -729,6 +751,8 @@ class PeerWorker(threading.Thread):
         if self.channel is None or self.sock is None:
             return
         self._send_raw(bytes([MSG_TEXT]) + text.encode("utf-8"))
+        if self.history is not None:
+            self.history.append(self.peer_name, "sent", text)
 
     def send_file(self, path_str: str):
         threading.Thread(target=self._send_file, args=(path_str,), daemon=True).start()
@@ -899,6 +923,16 @@ class SecureCommsApp(tk.Tk):
             font=("", 8),
         ).pack(anchor="w", pady=(0, 4))
 
+        self.save_history_var = tk.BooleanVar(value=False)
+        self.history_check = ttk.Checkbutton(
+            frame,
+            text="Save chat history to disk (encrypted, requires a passphrase)",
+            variable=self.save_history_var,
+        )
+        self.history_check.pack(anchor="w", pady=(0, 4))
+        self.history_check.state(["disabled"])
+        self.passphrase_var.trace_add("write", self._on_passphrase_changed)
+
         btns = ttk.Frame(frame)
         btns.pack(fill="x", pady=16)
         self.host_btn = ttk.Button(
@@ -994,6 +1028,16 @@ class SecureCommsApp(tk.Tk):
     def _start_connect(self):
         self._start_worker("connect")
 
+    def _on_passphrase_changed(self, *_args):
+        if self.passphrase_var.get():
+            self.history_check.state(["!disabled"])
+        else:
+            # No passphrase means no secret to derive a history-encryption
+            # key from - uncheck it too, not just disable, so it can't
+            # stay silently checked-but-inert.
+            self.save_history_var.set(False)
+            self.history_check.state(["disabled"])
+
     def _start_worker(self, role: str):
         name = self.name_var.get().strip()
         host = self.host_var.get().strip()
@@ -1005,13 +1049,27 @@ class SecureCommsApp(tk.Tk):
         if not name:
             messagebox.showerror("Missing name", "Please enter your name.")
             return
+        passphrase = self.passphrase_var.get() or None
+        save_history = self.save_history_var.get()
+        if save_history and not passphrase:
+            messagebox.showerror(
+                "Passphrase required",
+                "Saving chat history requires a passphrase - it's the "
+                "key the history file is encrypted with.",
+            )
+            return
 
         self.host_btn.state(["disabled"])
         self.connect_btn.state(["disabled"])
         self.status_var.set("Starting...")
-        passphrase = self.passphrase_var.get() or None
         self.worker = PeerWorker(
-            name, role, host, port, self.events, passphrase=passphrase
+            name,
+            role,
+            host,
+            port,
+            self.events,
+            passphrase=passphrase,
+            save_history=save_history,
         )
         self.worker.start()
 
@@ -1066,9 +1124,14 @@ class SecureCommsApp(tk.Tk):
     def _hide_transfer_bar(self):
         self.transfer_frame.pack_forget()
 
-    def _log(self, text: str, tag: str, label: str | None = None):
+    def _log(self, text: str, tag: str, label: str | None = None, when: float | None = None):
         self.log.configure(state="normal")
-        ts = datetime.now().strftime("%H:%M:%S")
+        # History replay passes the entry's original timestamp (a past
+        # date, possibly not today) instead of "now"; live messages don't.
+        if when is None:
+            ts = datetime.now().strftime("%H:%M:%S")
+        else:
+            ts = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
         prefix = f"[{ts}] {label}: " if label else f"[{ts}] "
         self.log.insert("end", prefix + text + "\n", tag)
         self.log.see("end")
@@ -1145,6 +1208,15 @@ class SecureCommsApp(tk.Tk):
             )
             ev["response"]["trusted"] = trusted
             ev["event"].set()
+        elif kind == "history_loaded":
+            if ev["entries"]:
+                self._log("----- Previous conversation -----", "system")
+                for entry in ev["entries"]:
+                    sent = entry["direction"] == "sent"
+                    tag = "me" if sent else "peer"
+                    label = self.worker.name if sent else self.worker.peer_name
+                    self._log(entry["text"], tag, label=label, when=entry["ts"])
+                self._log("----- New session -----", "system")
         elif kind == "handshake_done":
             self._chat_shown = True
             self.status_var.set("Secure channel established.")

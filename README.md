@@ -128,6 +128,7 @@ padding.py              Fixed-bucket plaintext padding (hides message length)
 secure_channel.py      Encrypted channel: ratchets + padding + sliding-window replay
 rate_limiter.py        Per-address handshake attempt throttling
 transport.py           TCP length-prefixed message framing (plumbing only)
+history.py              Opt-in, passphrase-encrypted local chat history (GUI only)
 server.py / client.py  Runnable two-party encrypted chat demo (terminal)
 gui.py                 Tkinter GUI - either side (Host or Connect) in one app
 test_secure_comms.py   Automated tests incl. tampering/replay/impersonation/ratchet
@@ -144,13 +145,17 @@ pip install cryptography pytest
 python3 -m pytest -v
 ```
 
-`test_secure_comms.py` covers the crypto/protocol modules (see below).
-`test_gui_file_transfer.py` and `test_gui_peerworker_integration.py`
-cover `gui.py`'s file-transfer framing and its reconnect-with-backoff
-loop - the latter drives two real `PeerWorker`s over real loopback TCP
-sockets (no Tk widgets involved) through a handshake, a multi-chunk file
-transfer, and a simulated dropped connection to confirm both sides
-reconnect and resume chatting.
+`test_secure_comms.py` covers the crypto/protocol modules, including
+`history.py` (encryption roundtrip, wrong-passphrase/corrupted-file
+rejection, per-peer filtering, and that the file on disk never contains
+plaintext). `test_gui_file_transfer.py` and
+`test_gui_peerworker_integration.py` cover `gui.py`'s file-transfer
+framing and its reconnect-with-backoff loop - the latter drives two real
+`PeerWorker`s over real loopback TCP sockets (no Tk widgets involved)
+through a handshake, a multi-chunk file transfer, a simulated dropped
+connection to confirm both sides reconnect and resume chatting, and a
+simulated app restart to confirm chat history survives and replays for
+the right peer.
 
 19 tests cover: successful handshake, bidirectional messaging, tampered
 ciphertext rejection, replay rejection, sliding-window reordering
@@ -278,6 +283,24 @@ fresh ratchet chain exactly like manually restarting would. A "Send" /
 "Send File" input is disabled while disconnected and re-enabled once the
 new handshake completes; a "Disconnect" button in the chat view stops
 the retry loop and returns to the connect screen.
+
+**Chat history** (`history.py`) is opt-in and off by default - check
+"Save chat history to disk" before connecting. It's only available for a
+passphrase-protected identity: forward secrecy protects past *on-the-wire*
+traffic from a leaked session key, but says nothing about a copy of the
+decrypted plaintext the app writes to disk afterward, and there's no
+honest way to encrypt that copy without a secret to derive a key from -
+an unencrypted log, or a key sitting next to its own ciphertext, isn't
+real protection. With history on, each local identity's log
+(`./gui_keys/{name}_history.enc`) is AES-256-GCM-encrypted with a key
+derived from the passphrase via scrypt (deliberately slow/memory-hard,
+unlike the HKDF used for the handshake's high-entropy session keys - a
+human passphrase needs a KDF that resists brute-forcing, not just
+whitening), and every append is written via a temp-file-then-rename so a
+crash mid-save can't corrupt history that was already durable. On
+reconnecting to a peer you've talked to before, the prior conversation is
+replayed into the chat window before the new session's messages. File
+transfers aren't recorded, only text messages.
 
 ## What this is _not_
 
