@@ -340,7 +340,7 @@ class PeerWorker(threading.Thread):
         self._limiter = None
         self._reconnect_attempt = 0
         self._inbound_transfers = {}
-        self._history_shown = False
+        self._history_shown_for = set()
 
     def emit(self, kind, **kwargs):
         self.events.put({"kind": kind, **kwargs})
@@ -400,12 +400,15 @@ class PeerWorker(threading.Thread):
                 return  # stop() was set before a handshake ever completed
 
             self._reconnect_attempt = 0
-            # Only replay history once per worker lifetime, not on every
-            # reconnect - the chat log already has it on screen from the
-            # first time, and re-dumping it on each auto-reconnect would
-            # just duplicate it.
-            if self.history is not None and not self._history_shown:
-                self._history_shown = True
+            # Only replay a given peer's history once, not on every
+            # reconnect to them - the chat log already has it on screen
+            # from the first time, and re-dumping it would just duplicate
+            # it. Tracked per peer, not as one worker-wide latch: on the
+            # host side, a single worker can serve a different peer on
+            # each reconnect (whoever dials in next), and that peer's own
+            # history must still get replayed the first time.
+            if self.history is not None and self.peer_name not in self._history_shown_for:
+                self._history_shown_for.add(self.peer_name)
                 self.emit("history_loaded", entries=self.history.for_peer(self.peer_name))
             self.emit("handshake_done")
             self._recv_loop()
@@ -598,14 +601,27 @@ class PeerWorker(threading.Thread):
                 continue
             self._handle_plaintext(plaintext)
 
+    def _append_history(self, direction: str, text: str):
+        """A local disk error (full disk, permissions, ...) writing
+        history must not take the whole chat session down with it -
+        history is a nice-to-have on top of the conversation, not the
+        other way around. Disables history for the rest of this session
+        rather than retrying every message, and tells the user once."""
+        if self.history is None:
+            return
+        try:
+            self.history.append(self.peer_name, direction, text)
+        except OSError as e:
+            self.history = None
+            self.emit("status", text=f"Chat history disabled: {e}")
+
     def _handle_plaintext(self, plaintext: bytes):
         if not plaintext:
             return
         msg_type, body = plaintext[0], plaintext[1:]
         if msg_type == MSG_TEXT:
             text = body.decode("utf-8", "replace")
-            if self.history is not None:
-                self.history.append(self.peer_name, "received", text)
+            self._append_history("received", text)
             self.emit("message", sender=self.peer_name, text=text)
         elif msg_type == MSG_FILE_OFFER:
             self._handle_file_offer(body)
@@ -751,8 +767,7 @@ class PeerWorker(threading.Thread):
         if self.channel is None or self.sock is None:
             return
         self._send_raw(bytes([MSG_TEXT]) + text.encode("utf-8"))
-        if self.history is not None:
-            self.history.append(self.peer_name, "sent", text)
+        self._append_history("sent", text)
 
     def send_file(self, path_str: str):
         threading.Thread(target=self._send_file, args=(path_str,), daemon=True).start()
