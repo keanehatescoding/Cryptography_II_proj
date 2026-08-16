@@ -922,13 +922,23 @@ class SecureCommsApp(tk.Tk):
         ).pack(pady=8, fill="x")
 
         self.fingerprint_var = tk.StringVar(value="")
-        ttk.Label(
+        fingerprint_label = ttk.Label(
             frame,
             textvariable=self.fingerprint_var,
             font=("Courier", 10),
             wraplength=480,
             justify="center",
-        ).pack()
+        )
+        fingerprint_label.pack(fill="x")
+        # A fixed wraplength only fits the window's initial 560px width -
+        # shrink the window down toward its 420px minsize (the word-phrase
+        # line is long enough to hit this in practice) and a constant
+        # wraplength would overflow instead of wrapping further. Recompute
+        # it from the frame's actual width on every resize instead.
+        frame.bind(
+            "<Configure>",
+            lambda e: fingerprint_label.configure(wraplength=max(e.width - 40, 100)),
+        )
 
     def _build_chat_frame(self):
         frame = ttk.Frame(self, padding=12)
