@@ -236,12 +236,20 @@ python3 gui.py   # window 2: enter name "alice",  click "Connect to peer"
 
 Each window shows your identity fingerprint at the top - the same one
 you'd read aloud to a peer over the phone to verify you're really talking
-to them before trusting a new identity (SSH-style TOFU). When two
-identities connect for the first time, you'll get a "Verify new identity"
-prompt showing the peer's fingerprint; accepting pins it for future
-sessions. After the handshake completes, the window switches to an
-encrypted chat view. All the cryptography is identical to the terminal
-demo - `gui.py` only adds a UI on top of the same modules.
+to them before trusting a new identity (SSH-style TOFU). Alongside the
+hex form, the GUI also renders it as a phrase of adjective-noun pairs
+(e.g. `brave-falcon calm-opal ...`, one pair per byte) - reading words
+aloud over a call is far less error-prone than reading hex nibbles one
+at a time, the same problem Signal's word-based safety numbers and the
+classic PGP word list solve. It's a pure display encoding of the same
+fingerprint (see `gui.py`'s `_fingerprint_to_words`); the hex form
+remains the identity's real form everywhere else (TrustStore, CLI, audit
+log). When two identities connect for the first time, you'll get a
+"Verify new identity" prompt showing the peer's fingerprint in both
+forms; accepting pins it for future sessions. After the handshake
+completes, the window switches to an encrypted chat view. All the
+cryptography is identical to the terminal demo - `gui.py` only adds a UI
+on top of the same modules.
 
 The optional **Passphrase** field encrypts a newly-created identity key,
 or unlocks an existing encrypted one - leave it blank for a brand-new
