@@ -40,28 +40,34 @@ one-way, capturing the ratchet's current state - a memory dump, a
 debugger attached mid-session - exposes only the current and future
 messages, not earlier ones in the same epoch.
 
-**Post-compromise healing (across epochs)**: every `REKEY_INTERVAL`
-messages (20 by default), a party generates a brand-new X25519 keypair,
-performs a fresh Diffie-Hellman exchange with the peer's most recent
-ratchet public key, and mixes the result into the root key to start a
-new epoch with a new chain key (`ratchet.py: dh_ratchet_step`). Because
-that new private key didn't exist yet at the time of any earlier
-compromise, an attacker who captured the _old_ state cannot derive keys
-for the _new_ epoch - even full knowledge of the old root key and old
-ratchet private key isn't enough (proven in
+**Post-compromise healing (across epochs)**: a party generates a
+brand-new X25519 keypair, performs a fresh Diffie-Hellman exchange with
+the peer's most recent ratchet public key, and mixes the result into the
+root key to start a new epoch with a new chain key (`ratchet.py:
+dh_ratchet_step`). Because that new private key didn't exist yet at the
+time of any earlier compromise, an attacker who captured the _old_ state
+cannot derive keys for the _new_ epoch - even full knowledge of the old
+root key and old ratchet private key isn't enough (proven in
 `test_post_compromise_healing_new_chain_not_derivable_from_leaked_old_state`).
 This closes the gap the symmetric ratchet alone leaves open: forward
 secrecy protects the past, the DH ratchet protects the future.
 
-Signal's Double Ratchet triggers this DH step _reactively_, on the first
-message of a new "sending turn" - that works because their X3DH
-handshake leaves the initiator with no sending chain at first, giving a
-natural trigger. Our handshake derives both directions' chains
-symmetrically, so that trigger doesn't exist here; the DH ratchet fires
-_periodically_ by message count instead (similar in spirit to how
-WireGuard rekeys on a message-count/time basis). Both approaches deliver
-the same healing property, just on a different schedule - see
-`ratchet.py` for the full reasoning.
+This DH step fires _reactively_ - the same trigger Signal's Double
+Ratchet uses in steady state: the moment a party accepts a message
+announcing a new peer ratchet pubkey, its own next send ratchets in
+reply, using that same pubkey. In an active back-and-forth conversation
+this heals on _every round trip_, tighter than any fixed schedule. The
+one real difference from Signal is the bootstrap: their X3DH handshake
+leaves the initiator with no sending chain at all, forcing a reactive
+ratchet on message 1 by necessity, whereas this system's handshake hands
+both sides a full, symmetric send+receive chain pair up front (see
+"Forward secrecy (within an epoch)" above) - so epoch 0 needs no ratchet
+from either side, and a `REKEY_INTERVAL`-messages/`REKEY_INTERVAL_SECONDS`
+fallback (in the spirit of how WireGuard rekeys) is what both kicks the
+reactive chain off in the first place _and_ covers a one-sided
+conversation that never gets a reply to react to - vanilla Double
+Ratchet has no such fallback and shares that same one-sided gap. See
+`secure_channel.py`'s module docstring for the full reasoning.
 
 **Traffic analysis resistance**: `padding.py` pads every plaintext up to
 the smallest of a fixed set of size buckets (32, 64, 128, ... 8192
@@ -180,10 +186,14 @@ out-of-order delivery via the skipped-key cache, rejection of a counter
 reused after its key was already consumed, the MAX_SKIP DoS bound, and
 an end-to-end SecureChannel integration check.
 
-6 more cover the DH ratchet: deterministic root-key mixing, a real
-periodic rekey with the peer correctly tracking the new epoch, normal
-bidirectional messaging across a rekey boundary, header tampering
-detection, a truncated-header rejection, and - the key property -
+8 more cover the DH ratchet: deterministic root-key mixing, a real
+periodic (count-triggered) rekey with the peer correctly tracking the
+new epoch, normal bidirectional messaging across a rekey boundary,
+header tampering detection, a truncated-header rejection, the reactive
+trigger firing on the very next send after accepting a peer's rekey
+announcement (well before the count/time fallback would have),
+a full back-and-forth conversation healing on every round trip once
+seeded, and - the key property -
 `test_post_compromise_healing_new_chain_not_derivable_from_leaked_old_state`,
 which mathematically demonstrates that even a full leak of the old root
 key and old ratchet private key cannot reproduce the new epoch's chain
@@ -337,12 +347,14 @@ transfers aren't recorded, only text messages.
 
 - Not a full PKI (see: mini-CA + certificate validation as a separate
   project idea) — no certificate chains, no revocation.
-- Not hardened for production: rekeying is on a fixed message-count
-  schedule rather than Signal's per-turn reactive trigger (see
-  `ratchet.py` for why), which means an attacker who compromises state
-  right after a rekey still has a window of up to `REKEY_INTERVAL`
-  messages before the next one heals it - shortening the interval trades
-  performance for a smaller window. Padding hides individual message
+- Not hardened for production: rekeying is reactive (see
+  `secure_channel.py` for how and why) with a message-count/time
+  fallback for one-sided traffic, so a compromise mid-conversation heals
+  on the next reply rather than waiting for a fixed schedule - but a
+  compromise during a one-sided monologue, or right before the fallback
+  fires, still has a window of up to `REKEY_INTERVAL` messages or
+  `REKEY_INTERVAL_SECONDS` before that heals it; shortening either trades
+  performance for a smaller worst-case window. Padding hides individual message
   length but not the number of messages sent or their timing - a
   determined observer can still build a traffic profile from _when_ and
   _how often_ messages flow, even with every message the same size. The

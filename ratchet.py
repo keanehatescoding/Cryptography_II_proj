@@ -23,19 +23,18 @@ Ratchet:
      is what the symmetric ratchet alone cannot provide (it only
      protects the past, not the future).
 
-Design note on WHEN the DH ratchet fires: Signal's Double Ratchet
-triggers a DH step reactively, on the first message of every new
-"sending turn" - which works because X3DH (their handshake) only gives
-the initiator a receiving chain up front, not a sending chain, so
-there's a natural "I have nothing to send with yet" trigger the first
-time they reply. Our handshake (handshake.py) is symmetric - both
-sides derive BOTH directions' chains during the handshake itself - so
-that trigger doesn't naturally exist here. Instead, SecureChannel uses
-PERIODIC re-keying: every REKEY_INTERVAL messages sent, a party
-proactively ratchets. This is a legitimate, simpler alternative used by
-other real protocols for the same purpose (e.g. WireGuard rekeys on a
-message-count/time basis) - it delivers the same post-compromise
-healing property, just on a schedule rather than reactively.
+Design note on WHEN the DH ratchet fires: SecureChannel (secure_channel.py)
+triggers a send-side step reactively - the same "ratchet when replying to
+a peer pubkey you haven't used yet" rule Signal's Double Ratchet uses in
+steady state - with a message-count/time fallback (in the spirit of how
+WireGuard rekeys) for a one-sided conversation that never gets a reply to
+react to. See secure_channel.py's module docstring for the full reasoning,
+including the one real difference from Signal: their X3DH handshake
+leaves the initiator with no sending chain at all, forcing a reactive
+ratchet on message 1 by necessity, whereas this system's handshake hands
+both sides a full, symmetric chain pair up front, so epoch 0 needs no
+ratchet from either side and the fallback is what kicks the reactive
+chain off in the first place.
 
 Out-of-order delivery: SecureChannel's sliding-window replay filter
 already tolerates reordered messages, so the receiving side of the

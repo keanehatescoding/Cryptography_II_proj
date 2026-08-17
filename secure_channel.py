@@ -22,19 +22,41 @@ with whether a rekey announcement is present (e.g. stripping it, or
 splicing one onto an unrelated message) is caught by GCM authentication
 just like tampering with the counter already was.
 
-Epoch rekeying: rather than Signal's reactive "ratchet on the first
-message of every new sending turn" (which relies on their asymmetric
-X3DH handshake leaving the initiator with no sending chain at first -
-see ratchet.py for the full explanation of why that trigger doesn't
-apply here), a party proactively generates a new DH ratchet keypair
-every REKEY_INTERVAL messages it sends, OR every REKEY_INTERVAL_SECONDS
-of wall-clock time since the last rekey, whichever comes first. The
-time trigger exists because a low-traffic session (few messages, but
-open for a long time) would otherwise never close its post-compromise-
-healing window under a pure message-count trigger - a state compromise
-early in a long idle session would stay exploitable indefinitely. The
-peer detects a new ratchet public key attached to an incoming message
-and performs the matching DH step to derive a new receiving chain.
+Epoch rekeying is reactive first, with count/time as a fallback:
+
+  - REACTIVE (primary): the moment a party accepts a message announcing
+    a new peer ratchet pubkey (a receive-side DH step just committed,
+    _commit_receive_ratchet_step), it owes the peer a reply in kind -
+    _send_ratchet_owed is set, and the NEXT message it sends performs
+    its own DH ratchet step before encrypting, using that same new peer
+    pubkey. This is Signal's actual steady-state trigger ("ratchet when
+    replying to a new key you haven't used yet"); the one difference
+    from Signal is the bootstrap: X3DH leaves their initiator with no
+    sending chain at all, forcing a ratchet on message 1 by necessity,
+    whereas this system's handshake (handshake.py: _derive_channel)
+    hands BOTH sides a full, symmetric send+receive chain pair up front
+    - so epoch 0 needs no ratchet from either side, and the reactive
+    chain only starts once something (originally: the count/time
+    fallback below) performs the first step.
+  - COUNT/TIME (fallback): every REKEY_INTERVAL messages sent, or every
+    REKEY_INTERVAL_SECONDS of wall-clock time since the last rekey,
+    whichever comes first. This is what actually kicks off ratcheting
+    from the symmetric epoch-0 state, and it's also what keeps a
+    ONE-SIDED conversation (a party that only ever sends and never
+    receives a reply) from healing forever: with nothing incoming,
+    there's nothing to react to, so pure reactive triggering alone
+    would never close that party's post-compromise-healing window - the
+    same gap a purely-periodic design already had for a low-traffic
+    session, just for a different traffic pattern. Vanilla Double
+    Ratchet has no such fallback and shares this same one-sided gap;
+    keeping count/time as a backstop here means BOTH bidirectional
+    conversations (healed every round-trip, tighter than a fixed
+    schedule) AND one-sided ones (healed within REKEY_INTERVAL messages
+    or REKEY_INTERVAL_SECONDS, same guarantee as before) are covered.
+
+Either way, the peer detects a new ratchet public key attached to an
+incoming message and performs the matching DH step to derive a new
+receiving chain - see ratchet.py for the full DH ratchet mechanics.
 
 Because both a send-triggered and a receive-triggered DH step can
 introduce a new chain at any wire counter, receiving chains are kept in
@@ -119,6 +141,14 @@ class SecureChannel:
         self._messages_since_rekey = 0
         self._last_rekey_time = time.monotonic()
         self._pad_messages = pad_messages
+        # Set whenever a receive-side ratchet step commits (i.e. the peer
+        # announced a ratchet public key we hadn't used yet) and cleared
+        # by the next send-side ratchet step, whatever triggers it. Lets
+        # encrypt() ratchet reactively - see its docstring and the module
+        # docstring for why. False at construction: epoch 0's state is
+        # symmetric (both sides derive it from the same handshake), so
+        # neither side owes the other a reactive step yet.
+        self._send_ratchet_owed = False
 
         self._send_counter = 0
         self._window_size = window_size
@@ -134,10 +164,18 @@ class SecureChannel:
         elapsed = time.monotonic() - self._last_rekey_time
         count_due = self._messages_since_rekey >= self._rekey_interval
         time_due = elapsed >= self._rekey_interval_seconds
-        if count_due or time_due:
-            self._perform_send_ratchet_step(
-                reason="count" if count_due else "time", elapsed=elapsed
-            )
+        # Reactive trigger takes priority: if the peer has announced a
+        # ratchet public key we haven't replied with a fresh one of our
+        # own for yet, catch up on THIS send rather than waiting for the
+        # count/time schedule - see the module docstring for why this is
+        # both possible and worth doing here. count/time stay as the
+        # fallback for a one-sided conversation (a party that only ever
+        # sends, never receives, has nothing to react to and would
+        # otherwise never heal - the same gap the time trigger already
+        # covers for a low-traffic session).
+        if self._send_ratchet_owed or count_due or time_due:
+            reason = "reactive" if self._send_ratchet_owed else ("count" if count_due else "time")
+            self._perform_send_ratchet_step(reason=reason, elapsed=elapsed)
             header = bytes([self.FLAG_REKEY]) + self._my_ratchet_pub_bytes
         else:
             header = bytes([self.FLAG_NO_REKEY])
@@ -164,6 +202,11 @@ class SecureChannel:
         self._my_ratchet_pub_bytes = cu.x25519_public_bytes(new_pub)
         self._messages_since_rekey = 0
         self._last_rekey_time = time.monotonic()
+        # Whatever triggered this step, it used the peer's latest known
+        # ratchet pubkey (_peer_ratchet_pub_bytes, kept current by
+        # _commit_receive_ratchet_step) - so any reactive debt is repaid
+        # regardless of why we ratcheted.
+        self._send_ratchet_owed = False
         security_logger.security(
             EventCode.REKEY_PERFORMED,
             "sending-side DH ratchet step performed",
@@ -301,6 +344,11 @@ class SecureChannel:
         self._recv_chains[start_counter] = pending.chain
         self._peer_ratchet_pub_bytes = pending.peer_pub_bytes
         self._prune_old_recv_chains()
+        # The peer just announced a ratchet pubkey we haven't replied
+        # with a fresh one of our own for yet - our next send should
+        # ratchet reactively rather than waiting for the count/time
+        # schedule (see encrypt()).
+        self._send_ratchet_owed = True
         security_logger.security(
             EventCode.REKEY_PERFORMED,
             "receiving-side DH ratchet step performed",
