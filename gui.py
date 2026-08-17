@@ -1151,7 +1151,13 @@ class SecureCommsApp(tk.Tk):
         if tab is None:
             return
         tab.worker.stop()
-        self.notebook.forget(tab)
+        # destroy(), not notebook.forget(): forget() only unmaps the tab
+        # from the notebook's layout, it doesn't free the underlying Tk
+        # widgets (the log, entry, buttons, ...) - repeated disconnect/
+        # reconnect cycles would otherwise leak them for the rest of the
+        # process's life. destroy() frees them and removes the tab from
+        # the notebook as a side effect, so forget() isn't needed too.
+        tab.destroy()
 
     def _worker_for(self, session_id: str) -> "PeerWorker | None":
         tab = self.sessions.get(session_id)
