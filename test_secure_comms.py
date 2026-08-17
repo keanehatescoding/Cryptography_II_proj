@@ -588,6 +588,70 @@ def test_channel_performs_periodic_dh_rekey_and_peer_tracks_it():
     assert bob_channel._root_key == alice_channel._root_key
 
 
+def test_reactive_rekey_fires_on_reply_before_the_fallback_schedule_would_have():
+    """The primary trigger: replying to a peer's rekey announcement
+    ratchets immediately on the very next send, regardless of how far
+    off the count/time fallback is - proving it's the reactive trigger
+    doing this, not bob's own schedule."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    alice_channel._rekey_interval = 1  # forces alice to rekey quickly
+    bob_channel._rekey_interval = 1000
+    bob_channel._rekey_interval_seconds = 10_000
+
+    initial_bob_pub = bob_channel._my_ratchet_pub_bytes
+
+    ct1 = alice_channel.encrypt(b"first")  # messages_since_rekey 0->1, not due yet (0 >= 1 is False)
+    bob_channel.decrypt(ct1)
+    assert bob_channel._send_ratchet_owed is False
+
+    ct2 = alice_channel.encrypt(b"second")  # now due (1 >= 1); alice rekeys and announces it
+    bob_channel.decrypt(ct2)
+    assert bob_channel._send_ratchet_owed is True, (
+        "bob must owe a reactive step after accepting alice's new ratchet pubkey"
+    )
+
+    reply = bob_channel.encrypt(b"bob replies")
+    assert bob_channel._my_ratchet_pub_bytes != initial_bob_pub, (
+        "bob's reply should have reactively rekeyed, not waited for his own count/time schedule"
+    )
+    assert bob_channel._send_ratchet_owed is False  # debt repaid
+    assert alice_channel.decrypt(reply) == b"bob replies"
+    assert alice_channel._peer_ratchet_pub_bytes == bob_channel._my_ratchet_pub_bytes
+
+
+def test_bidirectional_conversation_heals_every_round_trip_once_seeded():
+    """Once seeded, a back-and-forth conversation ratchets on every
+    reply - tighter healing than a fixed count/time schedule alone would
+    give, which is the whole point of preferring the reactive trigger.
+    Both channels' fallback thresholds are set unreachably high, so any
+    rekeys observed here can only be explained by the reactive trigger."""
+    alice, bob, alice_trust, bob_trust = make_pinned_pair()
+    alice_channel, bob_channel = do_handshake(alice, bob, alice_trust, bob_trust)
+    for ch in (alice_channel, bob_channel):
+        ch._rekey_interval = 10_000
+        ch._rekey_interval_seconds = 10_000
+
+    # Epoch 0 is symmetric (see secure_channel.py's module docstring) -
+    # nobody owes a reactive step yet. Seed it directly, standing in for
+    # whatever would normally kick off the very first rekey in practice
+    # (the count/time fallback, in production).
+    alice_channel._send_ratchet_owed = True
+
+    for i in range(3):
+        ct = alice_channel.encrypt(f"a{i}".encode())
+        assert bob_channel.decrypt(ct) == f"a{i}".encode()
+
+        bob_pub_before = bob_channel._my_ratchet_pub_bytes
+        reply = bob_channel.encrypt(f"b{i}".encode())
+        assert bob_channel._my_ratchet_pub_bytes != bob_pub_before, (
+            f"round {i}: bob should have reactively rekeyed in reply to alice's new pubkey"
+        )
+        assert alice_channel.decrypt(reply) == f"b{i}".encode()
+        # bob's reply now owes alice a reactive step of her own for the next round
+        assert alice_channel._send_ratchet_owed is True
+
+
 def test_channel_functions_normally_in_both_directions_across_a_rekey():
     """After alice rekeys mid-conversation, bob must still be able to
     both receive from alice AND reply back to her normally."""
