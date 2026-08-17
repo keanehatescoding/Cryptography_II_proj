@@ -199,7 +199,7 @@ which mathematically demonstrates that even a full leak of the old root
 key and old ratchet private key cannot reproduce the new epoch's chain
 key.
 
-32 tests in total.
+34 tests in total.
 
 6 more cover padding: round-tripping across a wide range of sizes,
 output always landing on a known bucket boundary (or exact multiple of
@@ -208,7 +208,7 @@ different plaintext lengths within the same bucket producing identical
 padded/ciphertext size - checked both in the padding module directly
 and through a real SecureChannel), corrupted-length-prefix rejection,
 too-short-input rejection, and the opt-out path for callers who disable
-padding. 39 tests in total.
+padding. 40 tests in total.
 
 5 more cover the TOFU trust-prompt flow shared by client.py and
 server.py (`TrustStore.verify_and_pin_interactive`): declining
@@ -221,7 +221,7 @@ where a forged rekey packet with an invalid GCM tag could still
 corrupt receiving-side ratchet state (root key, receiving chains,
 pinned peer pubkey) before the forgery was caught - decrypt() now
 computes a candidate ratchet step and only commits it after
-authentication succeeds. 44 tests in total.
+authentication succeeds. 45 tests in total.
 
 ## Running the live demo
 
