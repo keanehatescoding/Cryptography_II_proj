@@ -43,7 +43,7 @@ from handshake import (
     responder_respond,
 )
 from identity import Identity, TrustStore, fingerprint_for_bytes
-from rate_limiter import RateLimiter
+from rate_limiter import SQLiteRateLimiter
 from secure_channel import ReplayError, TamperError
 from audit_log import configure_logging
 
@@ -469,12 +469,17 @@ class PeerWorker(threading.Thread):
             srv.listen(5)
             srv.settimeout(0.5)  # lets the accept loop notice self._stop_event
             self._srv = srv
-            # Persists across repeated connection attempts on this listen
-            # socket (and across reconnects), so a peer who fails the
-            # handshake a few times in a row gets throttled rather than
-            # allowed unlimited retries.
-            self._limiter = RateLimiter(
-                max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0
+            # SQLite-backed (per identity, under KEY_DIR) rather than
+            # in-memory: persists across repeated connection attempts on
+            # this listen socket AND across reconnects, same as before,
+            # but now also across the app being closed and reopened - an
+            # attacker who trips the cooldown no longer gets a free reset
+            # just by waiting for (or forcing) a restart.
+            self._limiter = SQLiteRateLimiter(
+                f"{KEY_DIR}/{self.name}_ratelimit.db",
+                max_attempts=5,
+                window_seconds=60.0,
+                cooldown_seconds=30.0,
             )
         else:
             self.emit("status", text=f"Waiting for a peer on {self.host}:{self.port}...")

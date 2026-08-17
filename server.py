@@ -25,7 +25,7 @@ from handshake import (
     HandshakeError,
 )
 from secure_channel import ReplayError, TamperError
-from rate_limiter import RateLimiter
+from rate_limiter import SQLiteRateLimiter
 from audit_log import configure_logging
 
 HOST, PORT = "127.0.0.1", 8000
@@ -66,7 +66,7 @@ def load_or_create_identity(name: str) -> Identity:
 
 
 def handle_connection(
-    conn, addr, me: Identity, trust_store: TrustStore, limiter: RateLimiter
+    conn, addr, me: Identity, trust_store: TrustStore, limiter: SQLiteRateLimiter
 ):
     ip = addr[0]
     try:
@@ -131,7 +131,12 @@ def main():
 
     me = load_or_create_identity("bob")
     trust_store = TrustStore.load(f"{KEY_DIR}/bob_trust.json")
-    limiter = RateLimiter(max_attempts=5, window_seconds=60.0, cooldown_seconds=30.0)
+    limiter = SQLiteRateLimiter(
+        f"{KEY_DIR}/bob_ratelimit.db",
+        max_attempts=5,
+        window_seconds=60.0,
+        cooldown_seconds=30.0,
+    )
 
     print(f"[bob] identity fingerprint: {me.fingerprint}")
 

@@ -204,7 +204,7 @@ def test_forward_secrecy_ephemeral_keys_are_fresh_each_time():
 import tempfile
 import shutil
 
-from rate_limiter import RateLimiter
+from rate_limiter import RateLimiter, SQLiteRateLimiter
 import crypto_utils as cu
 import padding
 from ratchet import (
@@ -551,6 +551,95 @@ def test_rate_limiter_tracks_addresses_independently():
     rl.record_failure("5.6.7.8", now=t)
     assert rl.is_blocked("1.2.3.4", now=t)
     assert not rl.is_blocked("5.6.7.8", now=t)
+
+
+# -- SQLiteRateLimiter: same behavior as RateLimiter, plus persistence ----
+
+
+def test_sqlite_rate_limiter_blocks_after_max_attempts(tmp_path):
+    rl = SQLiteRateLimiter(str(tmp_path / "rl.db"), max_attempts=3, window_seconds=60.0, cooldown_seconds=30.0)
+    t = 1000.0
+    assert not rl.is_blocked("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t + 1)
+    assert not rl.is_blocked("1.2.3.4", now=t + 1)
+    rl.record_failure("1.2.3.4", now=t + 2)  # 3rd failure -> blocked
+    assert rl.is_blocked("1.2.3.4", now=t + 2)
+
+
+def test_sqlite_rate_limiter_unblocks_after_cooldown(tmp_path):
+    rl = SQLiteRateLimiter(str(tmp_path / "rl.db"), max_attempts=2, window_seconds=60.0, cooldown_seconds=10.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    assert rl.is_blocked("1.2.3.4", now=t + 5)
+    assert not rl.is_blocked("1.2.3.4", now=t + 11)
+
+
+def test_sqlite_rate_limiter_old_failures_age_out_of_window(tmp_path):
+    rl = SQLiteRateLimiter(str(tmp_path / "rl.db"), max_attempts=3, window_seconds=10.0, cooldown_seconds=30.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t + 1)
+    rl.record_failure("1.2.3.4", now=t + 20)
+    assert not rl.is_blocked("1.2.3.4", now=t + 20)
+
+
+def test_sqlite_rate_limiter_success_clears_history(tmp_path):
+    rl = SQLiteRateLimiter(str(tmp_path / "rl.db"), max_attempts=2, window_seconds=60.0, cooldown_seconds=30.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_success("1.2.3.4")
+    rl.record_failure("1.2.3.4", now=t + 1)  # would be failure #2 if history persisted
+    assert not rl.is_blocked("1.2.3.4", now=t + 1)
+
+
+def test_sqlite_rate_limiter_tracks_addresses_independently(tmp_path):
+    rl = SQLiteRateLimiter(str(tmp_path / "rl.db"), max_attempts=2, window_seconds=60.0, cooldown_seconds=30.0)
+    t = 1000.0
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("5.6.7.8", now=t)
+    assert rl.is_blocked("1.2.3.4", now=t)
+    assert not rl.is_blocked("5.6.7.8", now=t)
+
+
+def test_sqlite_rate_limiter_block_survives_a_simulated_restart(tmp_path):
+    """The entire point of this class: a fresh instance pointed at the
+    same db file (standing in for the app being restarted) must still
+    see the block, cooldown expiry, and per-address isolation exactly as
+    the original instance would have - state genuinely lives in the
+    file, not just cached in the Python object."""
+    db_path = str(tmp_path / "rl.db")
+    t = 1000.0
+
+    rl = SQLiteRateLimiter(db_path, max_attempts=2, window_seconds=60.0, cooldown_seconds=10.0)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("5.6.7.8", now=t)  # only one failure, should stay unblocked
+    assert rl.is_blocked("1.2.3.4", now=t)
+    rl.close()
+
+    restarted = SQLiteRateLimiter(db_path, max_attempts=2, window_seconds=60.0, cooldown_seconds=10.0)
+    assert restarted.is_blocked("1.2.3.4", now=t + 1), "block did not survive the restart"
+    assert not restarted.is_blocked("5.6.7.8", now=t + 1)
+    assert not restarted.is_blocked("1.2.3.4", now=t + 11), "cooldown expiry must still work post-restart"
+
+
+def test_sqlite_rate_limiter_window_aging_survives_a_simulated_restart(tmp_path):
+    db_path = str(tmp_path / "rl.db")
+    t = 1000.0
+
+    rl = SQLiteRateLimiter(db_path, max_attempts=3, window_seconds=10.0, cooldown_seconds=30.0)
+    rl.record_failure("1.2.3.4", now=t)
+    rl.record_failure("1.2.3.4", now=t + 1)
+    rl.close()
+
+    # "restart" well after those two failures' window has expired, then
+    # a single new failure must NOT immediately trip the 3-attempt limit
+    restarted = SQLiteRateLimiter(db_path, max_attempts=3, window_seconds=10.0, cooldown_seconds=30.0)
+    restarted.record_failure("1.2.3.4", now=t + 20)
+    assert not restarted.is_blocked("1.2.3.4", now=t + 20)
 
 
 def test_dh_ratchet_step_deterministic_and_distinct():
