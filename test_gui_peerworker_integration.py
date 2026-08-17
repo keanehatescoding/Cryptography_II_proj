@@ -472,4 +472,7 @@ def test_history_write_failure_disables_history_without_killing_the_session(monk
             events.append(worker.events.get_nowait())
         except queue.Empty:
             break
-    assert events == [{"kind": "status", "text": "Chat history disabled: No space left on device"}]
+    assert len(events) == 1
+    assert events[0]["kind"] == "status"
+    assert events[0]["text"] == "Chat history disabled: No space left on device"
+    assert events[0]["session_id"] == worker.session_id

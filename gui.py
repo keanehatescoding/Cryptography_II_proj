@@ -321,6 +321,7 @@ class PeerWorker(threading.Thread):
         events: queue.Queue,
         passphrase: str = None,
         save_history: bool = False,
+        session_id: str = None,
     ):
         super().__init__(daemon=True)
         self.name = name
@@ -331,6 +332,12 @@ class PeerWorker(threading.Thread):
         self.passphrase = passphrase or None
         self.save_history = save_history
         self.history = None
+        # Tags every event this worker emits, so a GUI juggling several
+        # concurrent PeerWorkers (multi-peer tabs) sharing one events
+        # queue can tell which tab/session an event belongs to. Defaults
+        # to a fresh id so existing single-session callers (and tests)
+        # don't need to know this exists.
+        self.session_id = session_id or uuid.uuid4().hex[:8]
         self.sock = None
         self.channel = None
         self.peer_name = None
@@ -343,7 +350,7 @@ class PeerWorker(threading.Thread):
         self._history_shown_for = set()
 
     def emit(self, kind, **kwargs):
-        self.events.put({"kind": kind, **kwargs})
+        self.events.put({"kind": kind, "session_id": self.session_id, **kwargs})
 
     def run(self):
         try:
@@ -863,15 +870,29 @@ class PeerWorker(threading.Thread):
 
 
 class SecureCommsApp(tk.Tk):
+    """One window, many concurrent encrypted sessions: a permanent "New
+    Connection" tab for starting the next Host/Connect attempt, plus one
+    tab per PeerWorker that's completed a handshake. All workers share a
+    single events queue; PeerWorker.emit() tags every event with its
+    session_id so _handle_event can route it to the right tab (or, for a
+    still-pending worker that hasn't reached its first handshake yet, to
+    the New Connection tab's own status/fingerprint display).
+
+    Only one connection attempt can be "pending" (pre-handshake) at a
+    time - Host/Connect are disabled while self.pending_worker is set -
+    but any number of already-established sessions can be open as tabs
+    simultaneously, each reconnecting independently in the background.
+    """
+
     def __init__(self):
         super().__init__()
         self.title("Secure Comms")
         self.geometry("560x640")
         self.minsize(420, 480)
 
-        self.worker: PeerWorker | None = None
+        self.pending_worker: PeerWorker | None = None
+        self.sessions: dict[str, ttk.Frame] = {}
         self.events: queue.Queue = queue.Queue()
-        self._chat_shown = False
 
         # -- new-message notifications ---------------------------------
         self._base_title = "Secure Comms"
@@ -880,19 +901,21 @@ class SecureCommsApp(tk.Tk):
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind("<FocusOut>", self._on_focus_out)
 
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         self._build_connect_frame()
-        self._build_chat_frame()
-        self.chat_frame.pack_forget()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
 
-    # -- layout --------------------------------------------------------
+    # -- layout: the permanent "New Connection" tab -----------------------
 
     def _build_connect_frame(self):
-        frame = ttk.Frame(self, padding=20)
-        frame.pack(fill="both", expand=True)
+        frame = ttk.Frame(self.notebook, padding=20)
         self.connect_frame = frame
+        self.notebook.add(frame, text="New Connection")
 
         ttk.Label(
             frame, text="Secure Communication System", font=("", 16, "bold")
@@ -989,51 +1012,64 @@ class SecureCommsApp(tk.Tk):
             lambda e: fingerprint_label.configure(wraplength=max(e.width - 40, 100)),
         )
 
-    def _build_chat_frame(self):
-        frame = ttk.Frame(self, padding=12)
-        self.chat_frame = frame
+    def _build_session_tab(self, worker: "PeerWorker") -> ttk.Frame:
+        """Builds one chat tab's widgets for `worker` and returns the
+        Frame with them attached as plain attributes (log, msg_var, ...) -
+        there's no separate session-state class; the Frame itself is the
+        per-session container, mirroring how self.log/self.msg_var etc.
+        used to be single instance attributes back when there was only
+        ever one session."""
+        session_id = worker.session_id
+        frame = ttk.Frame(self.notebook, padding=12)
+        frame.worker = worker
+        frame.chat_shown = False
+        frame.unread = 0
 
         header_row = ttk.Frame(frame)
         header_row.pack(fill="x")
-        self.header_var = tk.StringVar(value="")
+        frame.header_var = tk.StringVar(value="")
         ttk.Label(
-            header_row, textvariable=self.header_var, font=("", 11, "bold"), wraplength=440
+            header_row, textvariable=frame.header_var, font=("", 11, "bold"), wraplength=440
         ).pack(side="left", anchor="w")
-        ttk.Button(header_row, text="Disconnect", command=self._disconnect).pack(
-            side="right"
-        )
+        ttk.Button(
+            header_row, text="Disconnect", command=lambda: self._disconnect_session(session_id)
+        ).pack(side="right")
 
-        self.log = scrolledtext.ScrolledText(frame, state="disabled", wrap="word")
-        self.log.pack(fill="both", expand=True, pady=8)
-        self.log.tag_config("me", foreground="#0b5fff")
-        self.log.tag_config("peer", foreground="#1a7a1a")
-        self.log.tag_config("system", foreground="#888888")
-        self.log.tag_config("alert", foreground="#cc0000", font=("", 10, "bold"))
+        frame.log = scrolledtext.ScrolledText(frame, state="disabled", wrap="word")
+        frame.log.pack(fill="both", expand=True, pady=8)
+        frame.log.tag_config("me", foreground="#0b5fff")
+        frame.log.tag_config("peer", foreground="#1a7a1a")
+        frame.log.tag_config("system", foreground="#888888")
+        frame.log.tag_config("alert", foreground="#cc0000", font=("", 10, "bold"))
 
-        self.transfer_var = tk.StringVar(value="")
-        self.transfer_frame = ttk.Frame(frame)
+        frame.transfer_var = tk.StringVar(value="")
+        frame.transfer_frame = ttk.Frame(frame)
         ttk.Label(
-            self.transfer_frame, textvariable=self.transfer_var, foreground="#555"
+            frame.transfer_frame, textvariable=frame.transfer_var, foreground="#555"
         ).pack(side="left")
-        self.transfer_bar = ttk.Progressbar(
-            self.transfer_frame, mode="determinate", length=200
+        frame.transfer_bar = ttk.Progressbar(
+            frame.transfer_frame, mode="determinate", length=200
         )
-        self.transfer_bar.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        frame.transfer_bar.pack(side="left", padx=(6, 0), fill="x", expand=True)
 
         entry_row = ttk.Frame(frame)
         entry_row.pack(fill="x")
-        self.entry_row = entry_row
-        self.msg_var = tk.StringVar()
-        entry = ttk.Entry(entry_row, textvariable=self.msg_var)
+        frame.entry_row = entry_row
+        frame.msg_var = tk.StringVar()
+        entry = ttk.Entry(entry_row, textvariable=frame.msg_var)
         entry.pack(side="left", fill="x", expand=True)
-        entry.bind("<Return>", lambda _e: self._send())
-        self.send_btn = ttk.Button(entry_row, text="Send", command=self._send)
-        self.send_btn.pack(side="left", padx=(6, 0))
-        self.sendfile_btn = ttk.Button(
-            entry_row, text="Send File…", command=self._send_file
+        entry.bind("<Return>", lambda _e: self._send(session_id))
+        frame.msg_entry = entry
+        frame.send_btn = ttk.Button(
+            entry_row, text="Send", command=lambda: self._send(session_id)
         )
-        self.sendfile_btn.pack(side="left", padx=(6, 0))
-        self.msg_entry = entry
+        frame.send_btn.pack(side="left", padx=(6, 0))
+        frame.sendfile_btn = ttk.Button(
+            entry_row, text="Send File…", command=lambda: self._send_file(session_id)
+        )
+        frame.sendfile_btn.pack(side="left", padx=(6, 0))
+
+        return frame
 
     # -- actions ---------------------------------------------------------
 
@@ -1054,6 +1090,8 @@ class SecureCommsApp(tk.Tk):
             self.history_check.state(["disabled"])
 
     def _start_worker(self, role: str):
+        if self.pending_worker is not None:
+            return  # Host/Connect are disabled while one is already starting
         name = self.name_var.get().strip()
         host = self.host_var.get().strip()
         try:
@@ -1077,7 +1115,7 @@ class SecureCommsApp(tk.Tk):
         self.host_btn.state(["disabled"])
         self.connect_btn.state(["disabled"])
         self.status_var.set("Starting...")
-        self.worker = PeerWorker(
+        self.pending_worker = PeerWorker(
             name,
             role,
             host,
@@ -1086,61 +1124,103 @@ class SecureCommsApp(tk.Tk):
             passphrase=passphrase,
             save_history=save_history,
         )
-        self.worker.start()
+        self.pending_worker.start()
 
-    def _send(self):
-        text = self.msg_var.get()
-        if not text or self.worker is None or self.worker.channel is None:
+    def _send(self, session_id: str):
+        tab = self.sessions.get(session_id)
+        if tab is None:
             return
-        self.worker.send(text)
-        self._log(text, "me", label=self.worker.name)
-        self.msg_var.set("")
+        text = tab.msg_var.get()
+        if not text or tab.worker.channel is None:
+            return
+        tab.worker.send(text)
+        self._log(tab, text, "me", label=tab.worker.name)
+        tab.msg_var.set("")
 
-    def _send_file(self):
-        if self.worker is None or self.worker.channel is None:
+    def _send_file(self, session_id: str):
+        tab = self.sessions.get(session_id)
+        if tab is None or tab.worker.channel is None:
             return
         path = filedialog.askopenfilename(title="Select a file to send")
         if not path:
             return
-        self.worker.send_file(path)
+        tab.worker.send_file(path)
 
-    def _disconnect(self):
-        # Deliberately not nulling self.worker: a few in-flight events from
-        # the dying thread (e.g. a last "status") may still be queued, and
-        # their handlers read self.worker.peer_name - an AttributeError
-        # there would raise out of _poll_events and stop it from ever
-        # rescheduling itself, freezing the whole UI. The stale reference
-        # is harmless; _start_worker() overwrites it on the next connect.
-        if self.worker:
-            self.worker.stop()
-        self._chat_shown = False
-        self.chat_frame.pack_forget()
-        self.connect_frame.pack(fill="both", expand=True)
-        self.host_btn.state(["!disabled"])
-        self.connect_btn.state(["!disabled"])
-        self.status_var.set("Disconnected.")
-        self._hide_transfer_bar()
+    def _disconnect_session(self, session_id: str):
+        tab = self.sessions.pop(session_id, None)
+        if tab is None:
+            return
+        tab.worker.stop()
+        # destroy(), not notebook.forget(): forget() only unmaps the tab
+        # from the notebook's layout, it doesn't free the underlying Tk
+        # widgets (the log, entry, buttons, ...) - repeated disconnect/
+        # reconnect cycles would otherwise leak them for the rest of the
+        # process's life. destroy() frees them and removes the tab from
+        # the notebook as a side effect, so forget() isn't needed too.
+        tab.destroy()
 
-    def _set_chat_input_enabled(self, enabled: bool):
+    def _worker_for(self, session_id: str) -> "PeerWorker | None":
+        tab = self.sessions.get(session_id)
+        if tab is not None:
+            return tab.worker
+        if self.pending_worker is not None and self.pending_worker.session_id == session_id:
+            return self.pending_worker
+        return None
+
+    def _ensure_session_tab(self, session_id: str) -> "ttk.Frame | None":
+        """Creates the tab for `session_id` the first time it's needed
+        (called from whichever of history_loaded/handshake_done arrives
+        first for a newly-graduating session) and is a no-op after that.
+        Returns None for a stale session_id that matches neither an
+        existing tab nor the current pending worker - e.g. a very late
+        event from a worker that's since been disconnected."""
+        if session_id in self.sessions:
+            return self.sessions[session_id]
+        worker = self._worker_for(session_id)
+        if worker is None:
+            return None
+
+        tab = self._build_session_tab(worker)
+        self.sessions[session_id] = tab
+        self.notebook.add(tab, text=worker.peer_name or worker.name)
+        self.notebook.select(tab)
+
+        if self.pending_worker is worker:
+            # This connection has graduated from "pending" to a real tab -
+            # free the New Connection form for the next attempt. Not
+            # nulling pending_worker would be wrong here (unlike the
+            # single-session app's old _disconnect, which deliberately
+            # left a stale reference around): a NEW pending_worker must
+            # be able to start right away, and leaving the old one in
+            # place would make _worker_for keep resolving new pending-
+            # phase events to the wrong (already-graduated) worker.
+            self.pending_worker = None
+            self.host_btn.state(["!disabled"])
+            self.connect_btn.state(["!disabled"])
+            self.status_var.set("Ready to start another connection.")
+            self.fingerprint_var.set("")
+        return tab
+
+    def _set_chat_input_enabled(self, tab, enabled: bool):
         state = ["!disabled"] if enabled else ["disabled"]
-        self.msg_entry.state(state)
-        self.send_btn.state(state)
-        self.sendfile_btn.state(state)
+        tab.msg_entry.state(state)
+        tab.send_btn.state(state)
+        tab.sendfile_btn.state(state)
 
-    def _update_transfer_bar(self, label: str, done: int, total: int):
-        if not self.transfer_frame.winfo_ismapped():
-            self.transfer_frame.pack(fill="x", pady=(0, 8), before=self.entry_row)
+    def _update_transfer_bar(self, tab, label: str, done: int, total: int):
+        if not tab.transfer_frame.winfo_ismapped():
+            tab.transfer_frame.pack(fill="x", pady=(0, 8), before=tab.entry_row)
         percent = int(done / total * 100) if total else 100
-        self.transfer_bar["value"] = percent
-        self.transfer_var.set(
+        tab.transfer_bar["value"] = percent
+        tab.transfer_var.set(
             f"{label}: {percent}% ({_human_size(done)}/{_human_size(total)})"
         )
 
-    def _hide_transfer_bar(self):
-        self.transfer_frame.pack_forget()
+    def _hide_transfer_bar(self, tab):
+        tab.transfer_frame.pack_forget()
 
-    def _log(self, text: str, tag: str, label: str | None = None, when: float | None = None):
-        self.log.configure(state="normal")
+    def _log(self, tab, text: str, tag: str, label: str | None = None, when: float | None = None):
+        tab.log.configure(state="normal")
         # History replay passes the entry's original timestamp (a past
         # date, possibly not today) instead of "now"; live messages don't.
         if when is None:
@@ -1148,11 +1228,27 @@ class SecureCommsApp(tk.Tk):
         else:
             ts = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
         prefix = f"[{ts}] {label}: " if label else f"[{ts}] "
-        self.log.insert("end", prefix + text + "\n", tag)
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        tab.log.insert("end", prefix + text + "\n", tag)
+        tab.log.see("end")
+        tab.log.configure(state="disabled")
 
-    # -- new-message notifications ---------------------------------------
+    # -- tabs / new-message notifications ---------------------------------
+
+    def _on_tab_changed(self, _event=None):
+        selected = self.notebook.select()
+        for session_id, tab in self.sessions.items():
+            if str(tab) == selected and tab.unread:
+                tab.unread = 0
+                self._update_tab_title(session_id)
+
+    def _update_tab_title(self, session_id: str):
+        tab = self.sessions.get(session_id)
+        if tab is None:
+            return
+        label = tab.worker.peer_name or tab.worker.name
+        if tab.unread:
+            label = f"{label} ({tab.unread})"
+        self.notebook.tab(tab, text=label)
 
     def _on_focus_in(self, _event=None):
         self._window_focused = True
@@ -1162,16 +1258,22 @@ class SecureCommsApp(tk.Tk):
     def _on_focus_out(self, _event=None):
         self._window_focused = False
 
-    def _notify_incoming(self, sender: str, text: str):
+    def _notify_incoming(self, session_id: str, tab, sender: str, text: str):
         """Alert the user to a newly-received (already-decrypted) message.
 
         Called from _handle_event, which runs on the GUI thread via the
         Tk .after() poll loop, so it's safe to touch widgets directly.
-        The audible bell always fires; the OS popup and title badge are
-        reserved for when the window isn't focused, so this doesn't add
-        noise while you're actively looking at the conversation.
+        The audible bell always fires. A tab that isn't the one currently
+        showing gets an unread badge on its label regardless of window
+        focus (you might be looking at a different tab); the OS popup and
+        window-title badge are reserved for when the whole window isn't
+        focused, so switching between tabs within a focused window
+        doesn't also spam a desktop notification.
         """
         self.bell()
+        if str(tab) != self.notebook.select():
+            tab.unread += 1
+            self._update_tab_title(session_id)
         if self._window_focused:
             return
         self._unread_count += 1
@@ -1191,24 +1293,41 @@ class SecureCommsApp(tk.Tk):
 
     def _handle_event(self, ev: dict):
         kind = ev["kind"]
+        session_id = ev["session_id"]
         if kind == "identity":
+            # Identity/trust-store loading happens once, at the very
+            # start of a worker's run() - always before that worker's
+            # first handshake, so this is always about the pending
+            # connection, never an already-graduated tab.
             self.fingerprint_var.set(
                 f"Your identity fingerprint: {ev['fingerprint']}\n"
                 f"({_fingerprint_to_words(ev['fingerprint'])})"
             )
         elif kind == "status":
-            if self._chat_shown:
-                self._log(ev["text"], "system")
-            else:
+            tab = self.sessions.get(session_id)
+            if tab is not None:
+                self._log(tab, ev["text"], "system")
+            elif self.pending_worker is not None and self.pending_worker.session_id == session_id:
                 self.status_var.set(ev["text"])
         elif kind == "connection_lost":
-            self._set_chat_input_enabled(False)
-            self._hide_transfer_bar()
+            tab = self.sessions.get(session_id)
+            if tab is not None:
+                self._set_chat_input_enabled(tab, False)
+                self._hide_transfer_bar(tab)
         elif kind == "error":
-            self.status_var.set(ev["text"])
-            self.host_btn.state(["!disabled"])
-            self.connect_btn.state(["!disabled"])
-            messagebox.showerror("Error", ev["text"])
+            tab = self.sessions.get(session_id)
+            if tab is not None:
+                self._log(tab, f"Error: {ev['text']}", "alert")
+            elif self.pending_worker is not None and self.pending_worker.session_id == session_id:
+                # run() has already returned for this worker (every path
+                # that emits "error" is a fatal one it returns after) -
+                # release the slot, or Host/Connect would look re-enabled
+                # but silently no-op forever on the dead pending_worker.
+                self.pending_worker = None
+                self.status_var.set(ev["text"])
+                self.host_btn.state(["!disabled"])
+                self.connect_btn.state(["!disabled"])
+                messagebox.showerror("Error", ev["text"])
         elif kind == "trust_prompt":
             trusted = messagebox.askyesno(
                 "Verify new identity",
@@ -1224,62 +1343,100 @@ class SecureCommsApp(tk.Tk):
             ev["response"]["trusted"] = trusted
             ev["event"].set()
         elif kind == "history_loaded":
+            tab = self._ensure_session_tab(session_id)
+            if tab is None:
+                return
             if ev["entries"]:
-                self._log("----- Previous conversation -----", "system")
+                self._log(tab, "----- Previous conversation -----", "system")
                 for entry in ev["entries"]:
                     sent = entry["direction"] == "sent"
                     tag = "me" if sent else "peer"
-                    label = self.worker.name if sent else self.worker.peer_name
-                    self._log(entry["text"], tag, label=label, when=entry["ts"])
-                self._log("----- New session -----", "system")
+                    label = tab.worker.name if sent else tab.worker.peer_name
+                    self._log(tab, entry["text"], tag, label=label, when=entry["ts"])
+                self._log(tab, "----- New session -----", "system")
         elif kind == "handshake_done":
-            self._chat_shown = True
-            self.status_var.set("Secure channel established.")
-            self.header_var.set(
-                f"\U0001f512 Encrypted chat with {self.worker.peer_name}  "
+            tab = self._ensure_session_tab(session_id)
+            if tab is None:
+                return
+            tab.chat_shown = True
+            self._update_tab_title(session_id)
+            tab.header_var.set(
+                f"\U0001f512 Encrypted chat with {tab.worker.peer_name}  "
                 f"(AES-256-GCM, mutually authenticated, forward-secret)"
             )
-            self.connect_frame.pack_forget()
-            self.chat_frame.pack(fill="both", expand=True)
             self._log(
+                tab,
                 "Handshake complete - mutual authentication succeeded. "
                 "Session is now end-to-end encrypted.",
                 "system",
             )
-            self._set_chat_input_enabled(True)
-            self.msg_entry.focus_set()
+            self._set_chat_input_enabled(tab, True)
+            # Only steal keyboard focus if this tab is the one on screen -
+            # a background tab reconnecting shouldn't yank focus away from
+            # whatever the user is actually doing.
+            if str(tab) == self.notebook.select():
+                tab.msg_entry.focus_set()
         elif kind == "message":
-            self._log(ev["text"], "peer", label=ev["sender"])
-            self._notify_incoming(ev["sender"], ev["text"])
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self._log(tab, ev["text"], "peer", label=ev["sender"])
+            self._notify_incoming(session_id, tab, ev["sender"], ev["text"])
         elif kind == "security_alert":
-            self._log(f"SECURITY ALERT: {ev['text']}", "alert")
+            tab = self.sessions.get(session_id)
+            if tab is not None:
+                self._log(tab, f"SECURITY ALERT: {ev['text']}", "alert")
+            elif self.pending_worker is not None and self.pending_worker.session_id == session_id:
+                self.status_var.set(f"SECURITY ALERT: {ev['text']}")
         elif kind == "file_offer":
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
             self._log(
-                f"{self.worker.peer_name} is sending a file: "
+                tab,
+                f"{tab.worker.peer_name} is sending a file: "
                 f"{ev['name']} ({_human_size(ev['size'])})",
                 "system",
             )
         elif kind == "file_recv_progress":
-            self._update_transfer_bar(f"Receiving {ev['name']}", ev["received"], ev["total"])
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self._update_transfer_bar(tab, f"Receiving {ev['name']}", ev["received"], ev["total"])
         elif kind == "file_received":
-            self._hide_transfer_bar()
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self._hide_transfer_bar(tab)
             self._log(
+                tab,
                 f"Received file '{ev['name']}' ({_human_size(ev['size'])}) "
                 f"- saved to {ev['path']}",
                 "system",
             )
         elif kind == "file_send_progress":
-            self._update_transfer_bar(f"Sending {ev['name']}", ev["sent"], ev["total"])
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self._update_transfer_bar(tab, f"Sending {ev['name']}", ev["sent"], ev["total"])
         elif kind == "file_sent":
-            self._hide_transfer_bar()
-            self._log(f"Sent file '{ev['name']}' ({_human_size(ev['size'])})", "system")
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self._hide_transfer_bar(tab)
+            self._log(tab, f"Sent file '{ev['name']}' ({_human_size(ev['size'])})", "system")
         elif kind == "file_send_failed":
-            self._hide_transfer_bar()
-            self._log(f"Failed to send '{ev['name']}': {ev['text']}", "alert")
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self._hide_transfer_bar(tab)
+            self._log(tab, f"Failed to send '{ev['name']}': {ev['text']}", "alert")
 
     def _on_close(self):
-        if self.worker:
-            self.worker.stop()
+        if self.pending_worker:
+            self.pending_worker.stop()
+        for tab in self.sessions.values():
+            tab.worker.stop()
         self.destroy()
 
 
