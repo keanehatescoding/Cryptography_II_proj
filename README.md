@@ -157,6 +157,16 @@ connection to confirm both sides reconnect and resume chatting, and a
 simulated app restart to confirm chat history survives and replays for
 the right peer.
 
+None of this needs an actual Tk display: `PeerWorker` has no Tk
+dependency (it only ever talks to its consumer through a queue.Queue of
+event dicts), so these tests exercise the real networking/threading/
+crypto logic - including the `session_id` tagging multi-peer tabs rely
+on - directly, which is also why CI (no virtual display available) can
+run them. The `SecureCommsApp` Tk widget layer itself (tabs, per-session
+widgets, unread badges, ...) is verified with manual smoke tests driving
+real `SecureCommsApp` instances under Xvfb, not part of the automated
+suite.
+
 19 tests cover: successful handshake, bidirectional messaging, tampered
 ciphertext rejection, replay rejection, sliding-window reordering
 tolerance, replay-of-a-reordered-message rejection, out-of-window
@@ -239,22 +249,38 @@ python3 gui.py   # window 1: enter name "bob",   click "Host (wait for peer)"
 python3 gui.py   # window 2: enter name "alice",  click "Connect to peer"
 ```
 
-Each window shows your identity fingerprint at the top - the same one
-you'd read aloud to a peer over the phone to verify you're really talking
-to them before trusting a new identity (SSH-style TOFU). Alongside the
-hex form, the GUI also renders it as a phrase of adjective-noun pairs
-(e.g. `brave-falcon calm-opal ...`, one pair per byte) - reading words
-aloud over a call is far less error-prone than reading hex nibbles one
-at a time, the same problem Signal's word-based safety numbers and the
-classic PGP word list solve. It's a pure display encoding of the same
-fingerprint (see `gui.py`'s `_fingerprint_to_words`); the hex form
-remains the identity's real form everywhere else (TrustStore, CLI, audit
-log). When two identities connect for the first time, you'll get a
-"Verify new identity" prompt showing the peer's fingerprint in both
-forms; accepting pins it for future sessions. After the handshake
-completes, the window switches to an encrypted chat view. All the
-cryptography is identical to the terminal demo - `gui.py` only adds a UI
-on top of the same modules.
+A window's "New Connection" tab shows your identity fingerprint at the
+top - the same one you'd read aloud to a peer over the phone to verify
+you're really talking to them before trusting a new identity (SSH-style
+TOFU). Alongside the hex form, the GUI also renders it as a phrase of
+adjective-noun pairs (e.g. `brave-falcon calm-opal ...`, one pair per
+byte) - reading words aloud over a call is far less error-prone than
+reading hex nibbles one at a time, the same problem Signal's word-based
+safety numbers and the classic PGP word list solve. It's a pure display
+encoding of the same fingerprint (see `gui.py`'s `_fingerprint_to_words`);
+the hex form remains the identity's real form everywhere else (TrustStore,
+CLI, audit log). When two identities connect for the first time, you'll
+get a "Verify new identity" prompt showing the peer's fingerprint in both
+forms; accepting pins it for future sessions. All the cryptography is
+identical to the terminal demo - `gui.py` only adds a UI on top of the
+same modules.
+
+**Multiple concurrent sessions**: each successful handshake opens its
+own tab and frees the "New Connection" tab for the next attempt, so one
+window can Host for one peer and Connect out to several others at once,
+each chatting, transferring files, reconnecting, and replaying its own
+history completely independently. A dropped connection or a security
+alert only affects its own tab. A tab that isn't the one currently
+selected gets an unread-count badge on its label when a message arrives
+(even if the window itself is focused - you might just be looking at a
+different tab); the OS-level popup and window-title badge are reserved
+for when the whole window has lost focus, so switching tabs within a
+focused window doesn't also spam a desktop notification. Every
+`PeerWorker` tags its events with a `session_id` so the shared events
+queue can be routed to the right tab (or, before a connection's first
+handshake completes, to the "New Connection" tab's own status/fingerprint
+display - only one connection attempt can be *pending* at a time, though
+any number of already-established ones can run concurrently).
 
 The optional **Passphrase** field encrypts a newly-created identity key,
 or unlocks an existing encrypted one - leave it blank for a brand-new

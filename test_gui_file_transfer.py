@@ -24,12 +24,18 @@ def make_worker(tmp_path, monkeypatch):
 
 
 def drain(worker):
+    """Every event carries a session_id (see PeerWorker.emit) so a GUI
+    juggling several concurrent workers can route it to the right tab -
+    stripped here since none of these tests care about routing, only
+    about what PeerWorker decided to emit."""
     events = []
     while True:
         try:
-            events.append(worker.events.get_nowait())
+            ev = worker.events.get_nowait()
         except queue.Empty:
             return events
+        ev.pop("session_id", None)
+        events.append(ev)
 
 
 # -- _human_size -------------------------------------------------------
@@ -185,6 +191,32 @@ def test_text_message_still_dispatches_as_before(tmp_path, monkeypatch):
 
     events = drain(worker)
     assert events == [{"kind": "message", "sender": "bob", "text": "hi there"}]
+
+
+# -- multi-session event routing ------------------------------------------
+
+
+def test_every_emitted_event_carries_the_workers_session_id(tmp_path, monkeypatch):
+    """A GUI juggling several concurrent PeerWorkers on one shared events
+    queue needs every event tagged with which worker/session it came
+    from - and workers given no explicit session_id must still each get
+    their own distinct one, not share a default."""
+    worker = make_worker(tmp_path, monkeypatch)
+    worker._handle_plaintext(bytes([gui.MSG_TEXT]) + "hi".encode("utf-8"))
+    [ev] = list(_drain_raw(worker))
+    assert ev["session_id"] == worker.session_id
+
+    other = gui.PeerWorker("carol", "connect", "127.0.0.1", 8000, queue.Queue())
+    assert other.session_id != worker.session_id
+
+
+def _drain_raw(worker):
+    events = []
+    while True:
+        try:
+            events.append(worker.events.get_nowait())
+        except queue.Empty:
+            return events
 
 
 # -- reconnect backoff ----------------------------------------------------
