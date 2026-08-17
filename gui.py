@@ -1313,6 +1313,11 @@ class SecureCommsApp(tk.Tk):
             if tab is not None:
                 self._log(tab, f"Error: {ev['text']}", "alert")
             elif self.pending_worker is not None and self.pending_worker.session_id == session_id:
+                # run() has already returned for this worker (every path
+                # that emits "error" is a fatal one it returns after) -
+                # release the slot, or Host/Connect would look re-enabled
+                # but silently no-op forever on the dead pending_worker.
+                self.pending_worker = None
                 self.status_var.set(ev["text"])
                 self.host_btn.state(["!disabled"])
                 self.connect_btn.state(["!disabled"])

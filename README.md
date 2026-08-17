@@ -241,8 +241,11 @@ anything.
 
 ## Running the GUI
 
-Requires `tkinter` (usually bundled with Python; on Debian/Ubuntu:
-`sudo apt-get install python3-tk`). Same directory, two windows:
+Requires Python 3.10+ (the codebase uses `X | None` union type hints
+throughout, evaluated at function-definition time) and `tkinter`
+(usually bundled with Python; on Debian/Ubuntu:
+`sudo apt-get install python3-tk`). CI runs on 3.11 and 3.12. Same
+directory, two windows:
 
 ```bash
 python3 gui.py   # window 1: enter name "bob",   click "Host (wait for peer)"
@@ -265,12 +268,14 @@ forms; accepting pins it for future sessions. All the cryptography is
 identical to the terminal demo - `gui.py` only adds a UI on top of the
 same modules.
 
-**Multiple concurrent sessions**: each successful handshake opens its
-own tab and frees the "New Connection" tab for the next attempt, so one
-window can Host for one peer and Connect out to several others at once,
-each chatting, transferring files, reconnecting, and replaying its own
-history completely independently. A dropped connection or a security
-alert only affects its own tab. A tab that isn't the one currently
+**Multiple concurrent sessions**: each new session's first successful
+handshake opens its own tab and frees the "New Connection" tab for the
+next attempt, so one window can Host for one peer and Connect out to
+several others at once, each chatting, transferring files, and replaying
+its own history completely independently. A *reconnect's* handshake
+reuses that same tab rather than opening a duplicate one - see
+`_ensure_session_tab`, which is a no-op once a session already has a tab.
+A dropped connection or a security alert only affects its own tab. A tab that isn't the one currently
 selected gets an unread-count badge on its label when a message arrives
 (even if the window itself is focused - you might just be looking at a
 different tab); the OS-level popup and window-title badge are reserved
