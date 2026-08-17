@@ -18,6 +18,7 @@ import threading
 import time
 
 import gui
+import history
 
 
 def _free_port() -> int:
@@ -279,3 +280,196 @@ def test_stalled_peer_does_not_block_later_peers(tmp_path, monkeypatch):
     finally:
         host_worker.stop()
         host_worker.join(timeout=5)
+
+
+def test_history_persists_across_a_restart_and_replays_for_the_same_peer(tmp_path, monkeypatch):
+    """End-to-end: two real PeerWorkers, real handshake, real chat, with
+    save_history=True on both sides. Stop them, start a brand-new pair of
+    workers under the same names/passphrases (simulating the app being
+    closed and reopened), and confirm the prior conversation comes back
+    via a history_loaded event - scoped to the right peer."""
+    monkeypatch.setattr(gui, "FILE_RECV_DIR", tmp_path / "received")
+    monkeypatch.setattr(gui, "KEY_DIR", str(tmp_path / "keys"))
+
+    def run_session(port, host_events=None, connect_events=None):
+        host_events = host_events if host_events is not None else []
+        connect_events = connect_events if connect_events is not None else []
+        host_worker = gui.PeerWorker(
+            "bob4", "host", "127.0.0.1", port, queue.Queue(),
+            passphrase="hunter2", save_history=True,
+        )
+        connect_worker = gui.PeerWorker(
+            "alice4", "connect", "127.0.0.1", port, queue.Queue(),
+            passphrase="hunter2", save_history=True,
+        )
+        _start_event_pump(host_worker, host_events)
+        _start_event_pump(connect_worker, connect_events)
+        host_worker.start()
+        assert _wait_for(lambda: host_worker._srv is not None, timeout=5)
+        connect_worker.start()
+        # Wait for handshake_done specifically (not just channel being
+        # set): history_loaded is emitted strictly before handshake_done,
+        # so once handshake_done has actually landed in the collected
+        # events list, history_loaded is guaranteed to already be there
+        # too - checking channel directly races the event-pump thread.
+        assert _wait_for(
+            lambda: any(e["kind"] == "handshake_done" for e in host_events)
+            and any(e["kind"] == "handshake_done" for e in connect_events),
+            timeout=10,
+        )
+        return host_worker, connect_worker, host_events, connect_events
+
+    port = _free_port()
+    host1, connect1, host1_events, connect1_events = run_session(port)
+    try:
+        connect1.send("hello from session one")
+        assert _wait_for(
+            lambda: any(
+                e["kind"] == "message" and e.get("text") == "hello from session one"
+                for e in host1_events
+            ),
+            timeout=5,
+        )
+        host1.send("got it, bob here")
+        assert _wait_for(
+            lambda: any(
+                e["kind"] == "message" and e.get("text") == "got it, bob here"
+                for e in connect1_events
+            ),
+            timeout=5,
+        )
+    finally:
+        connect1.stop()
+        host1.stop()
+        connect1.join(timeout=5)
+        host1.join(timeout=5)
+
+    # A fresh pair of workers, same identities/passphrases, different port
+    # (simulates closing and reopening the app) - history must survive.
+    port2 = _free_port()
+    host2, connect2, host2_events, connect2_events = run_session(port2)
+    try:
+        host2_history = [e for e in host2_events if e["kind"] == "history_loaded"]
+        connect2_history = [e for e in connect2_events if e["kind"] == "history_loaded"]
+        assert len(host2_history) == 1
+        assert len(connect2_history) == 1
+
+        host_texts = [(e["direction"], e["text"]) for e in host2_history[0]["entries"]]
+        connect_texts = [(e["direction"], e["text"]) for e in connect2_history[0]["entries"]]
+        assert host_texts == [
+            ("received", "hello from session one"),
+            ("sent", "got it, bob here"),
+        ]
+        assert connect_texts == [
+            ("sent", "hello from session one"),
+            ("received", "got it, bob here"),
+        ]
+    finally:
+        connect2.stop()
+        host2.stop()
+        connect2.join(timeout=5)
+        host2.join(timeout=5)
+
+
+def test_history_replay_latch_is_per_peer_not_worker_wide(tmp_path, monkeypatch):
+    """Regression test: one host worker's listening socket persists
+    across reconnects, so it can go on to serve a completely different
+    peer after the first one disconnects (see PeerWorker docstring). The
+    history-replay-once guard must therefore track "have I shown peer X
+    their history yet", not "have I shown history at all" - otherwise the
+    second, different peer never gets their own (real, pre-existing)
+    history replayed just because some earlier peer already consumed a
+    worker-wide latch."""
+    monkeypatch.setattr(gui, "FILE_RECV_DIR", tmp_path / "received")
+    keydir = tmp_path / "keys"
+    monkeypatch.setattr(gui, "KEY_DIR", str(keydir))
+
+    # Pre-seed hostX's history with a prior conversation with peerB -
+    # simulates a session that happened before this test even starts.
+    seeded = history.EncryptedHistory.load("hostX", str(keydir), passphrase="hostpass")
+    seeded.append("peerB", "received", "message from a previous session")
+
+    port = _free_port()
+    host_worker = gui.PeerWorker(
+        "hostX", "host", "127.0.0.1", port, queue.Queue(),
+        passphrase="hostpass", save_history=True,
+    )
+    host_seen = []
+    _start_event_pump(host_worker, host_seen)
+
+    try:
+        host_worker.start()
+        assert _wait_for(lambda: host_worker._srv is not None, timeout=5)
+
+        # peerA connects first - brand new peer, no prior history - then
+        # disconnects (without stopping the host).
+        peer_a = gui.PeerWorker("peerA", "connect", "127.0.0.1", port, queue.Queue())
+        _start_event_pump(peer_a, [])
+        peer_a.start()
+        assert _wait_for(
+            lambda: any(e["kind"] == "handshake_done" for e in host_seen), timeout=10
+        )
+        peer_a.stop()
+        peer_a.join(timeout=5)
+        assert _wait_for(
+            lambda: any(e["kind"] == "connection_lost" for e in host_seen), timeout=5
+        ), "host never noticed peerA disconnect"
+
+        # host goes back to listening; peerB (who HAS prior history with
+        # hostX) connects next.
+        peer_b = gui.PeerWorker(
+            "peerB", "connect", "127.0.0.1", port, queue.Queue(), passphrase="anything"
+        )
+        peer_b_seen = []
+        _start_event_pump(peer_b, peer_b_seen)
+        peer_b.start()
+        try:
+            assert _wait_for(
+                lambda: sum(1 for e in host_seen if e["kind"] == "handshake_done") >= 2,
+                timeout=10,
+            ), "host never completed a second handshake, with peerB"
+
+            # One history_loaded event per peer (peerA's is empty - a
+            # brand new peer with no prior history - peerB's has the
+            # pre-seeded entry). Both must be present: peerA's empty one
+            # proves the latch fired for peerA at all, and peerB's
+            # non-empty one is the actual regression this test guards.
+            host_history_events = [e for e in host_seen if e["kind"] == "history_loaded"]
+            assert len(host_history_events) == 2
+            all_texts = [e["text"] for ev in host_history_events for e in ev["entries"]]
+            assert all_texts == ["message from a previous session"], (
+                "peerB's real prior history must still be replayed even though "
+                "peerA (a different, history-less peer) already connected once"
+            )
+        finally:
+            peer_b.stop()
+            peer_b.join(timeout=5)
+    finally:
+        host_worker.stop()
+        host_worker.join(timeout=5)
+
+
+def test_history_write_failure_disables_history_without_killing_the_session(monkeypatch):
+    """Regression test: a local disk error persisting history (full disk,
+    permissions, ...) must not take the whole chat session down with it -
+    history is a nice-to-have layered on top of the conversation. Drives
+    PeerWorker._append_history directly (no real socket needed) with a
+    fake history object that always fails to append."""
+    worker = gui.PeerWorker("alice5", "connect", "127.0.0.1", 8000, queue.Queue())
+    worker.peer_name = "bob5"
+
+    class BrokenHistory:
+        def append(self, peer_name, direction, text):
+            raise OSError("No space left on device")
+
+    worker.history = BrokenHistory()
+    worker._append_history("sent", "this should not crash anything")
+
+    assert worker.history is None, "history must be disabled after a persistence failure"
+    events = []
+    while True:
+        try:
+            events.append(worker.events.get_nowait())
+        except queue.Empty:
+            break
+    assert events == [{"kind": "status", "text": "Chat history disabled: No space left on device"}]

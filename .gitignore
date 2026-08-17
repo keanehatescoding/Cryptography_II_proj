@@ -2,6 +2,7 @@ gui_keys/
 demo_keys/
 received_files/
 *.pem
+*_history.enc
 __pycache__
 .venv
 secure_comms_audit.log
