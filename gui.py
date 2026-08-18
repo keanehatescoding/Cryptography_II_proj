@@ -136,13 +136,26 @@ def _unique_dest_path(directory: Path, name: str) -> Path:
         i += 1
 
 
-def _notify_desktop(title: str, message: str) -> None:
+def _notify_desktop(title: str, message: str, on_click=None) -> None:
     """Best-effort native OS notification for an incoming message.
 
     Deliberately dependency-free (uses whatever notifier ships with the
     OS) and deliberately swallows every error: a missing `notify-send`
     binary or a sandboxed/headless environment should never crash the
     chat session over a nice-to-have.
+
+    `on_click`, if given, is called (from a background thread - it must
+    be thread-safe and must NOT touch Tk widgets directly, see
+    SecureCommsApp._notify_incoming) when the user clicks the
+    notification. This is only honored on Windows: `osascript display
+    notification` (macOS) has no click-callback mechanism at all, and
+    `notify-send` (Linux) is a fire-and-forget CLI that hands the
+    notification to a D-Bus daemon and exits immediately - actually
+    receiving its `ActionInvoked` signal back would mean staying alive
+    as a D-Bus listener, which needs a real D-Bus client library (not a
+    dependency this project takes on for a nice-to-have). On both
+    platforms the audible bell, per-tab unread badge, and window-title
+    badge (see _notify_incoming) remain the notification mechanism.
     """
     try:
         system = platform.system()
@@ -169,12 +182,12 @@ def _notify_desktop(title: str, message: str) -> None:
             # No notify-send available (e.g. minimal WM/headless): the
             # audible bell + title badge still cover it.
         elif system == "Windows":
-            _notify_windows(title, message)
+            _notify_windows(title, message, on_click=on_click)
     except Exception:
         pass
 
 
-def _notify_windows(title: str, message: str) -> None:
+def _notify_windows(title: str, message: str, on_click=None) -> None:
     """Native Windows balloon notification via pywin32's Shell_NotifyIcon.
 
     pywin32 is an optional dependency (not in requirements.txt), so the
@@ -183,9 +196,10 @@ def _notify_windows(title: str, message: str) -> None:
     should never crash the chat session over a nice-to-have.
 
     The whole register-window / add-icon / pop-balloon / tear-down
-    sequence runs on its own daemon thread because it needs a short
-    sleep to give the balloon time to actually appear before the icon
-    is removed, and that must never block the Tk main loop.
+    sequence runs on its own daemon thread because it needs to pump
+    messages for a few seconds to give the balloon time to appear (and
+    to actually be able to detect a click on it - see below), and that
+    must never block the Tk main loop.
     """
 
     def _show():
@@ -196,11 +210,29 @@ def _notify_windows(title: str, message: str) -> None:
         except ImportError:
             return
 
+        # Shell_NotifyIcon delivers user interaction (balloon click, or a
+        # click on the tray icon itself while the balloon is still up)
+        # as a callback message - the WM_USER+20 registered below - whose
+        # lParam identifies which one. NIN_BALLOONUSERCLICK isn't always
+        # exposed by win32con, so it's given explicitly (it's WM_USER+5,
+        # a fixed Windows Shell constant, not something that varies).
+        NIN_BALLOONUSERCLICK = win32con.WM_USER + 5
+        clicked = False
+
+        def _on_notify_message(hwnd, msg, wparam, lparam):
+            nonlocal clicked
+            if lparam in (win32con.WM_LBUTTONUP, NIN_BALLOONUSERCLICK):
+                clicked = True
+            return 0
+
         try:
             wc = win32gui.WNDCLASS()
             wc.hInstance = win32api.GetModuleHandle(None)
             wc.lpszClassName = "SecureCommsNotifyIcon"
-            wc.lpfnWndProc = {win32con.WM_DESTROY: lambda hwnd, msg, wparam, lparam: 0}
+            wc.lpfnWndProc = {
+                win32con.WM_DESTROY: lambda hwnd, msg, wparam, lparam: 0,
+                win32con.WM_USER + 20: _on_notify_message,
+            }
 
             try:
                 class_atom = win32gui.RegisterClass(wc)
@@ -248,10 +280,18 @@ def _notify_windows(title: str, message: str) -> None:
                     win32gui.NIIF_INFO,
                 ),
             )
-            # The balloon pop is asynchronous; hold the tray icon around
-            # long enough for Windows to actually display it before we
-            # clean up, or it can get dropped silently.
-            time.sleep(4)
+            # The balloon pop is asynchronous, and a plain sleep() would
+            # never let _on_notify_message actually run - the window's
+            # message queue only gets processed if something pumps it.
+            # Poll it non-blockingly for a few seconds (long enough to
+            # show *and* give the user a moment to click it), bailing
+            # out early the instant a click is seen.
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline and not clicked:
+                win32gui.PumpWaitingMessages()
+                time.sleep(0.05)
+            if clicked and on_click is not None:
+                on_click()
         except Exception:
             pass
         finally:
@@ -1295,7 +1335,18 @@ class SecureCommsApp(tk.Tk):
         self._unread_count += 1
         self.title(f"({self._unread_count}) {self._base_title} - new message")
         preview = text if len(text) <= 80 else text[:77] + "..."
-        _notify_desktop(f"New message from {sender}", preview)
+        # The click callback (Windows only - see _notify_desktop) fires
+        # on a background thread, so it must not touch Tk widgets
+        # directly; queuing a "focus_requested" event reuses the same
+        # thread-safe hand-off every PeerWorker already uses to talk to
+        # the GUI thread, rather than inventing a second mechanism.
+        _notify_desktop(
+            f"New message from {sender}",
+            preview,
+            on_click=lambda: self.events.put(
+                {"kind": "focus_requested", "session_id": session_id}
+            ),
+        )
 
     # -- event loop --------------------------------------------------------
 
@@ -1398,6 +1449,16 @@ class SecureCommsApp(tk.Tk):
                 return
             self._log(tab, ev["text"], "peer", label=ev["sender"])
             self._notify_incoming(session_id, tab, ev["sender"], ev["text"])
+        elif kind == "focus_requested":
+            # Only reachable today via a click on a native Windows
+            # balloon notification (see _notify_desktop) - selects that
+            # message's tab and brings the window to the front.
+            tab = self.sessions.get(session_id)
+            if tab is not None:
+                self.notebook.select(tab)
+            self.deiconify()
+            self.lift()
+            self.focus_force()
         elif kind == "security_alert":
             tab = self.sessions.get(session_id)
             if tab is not None:
