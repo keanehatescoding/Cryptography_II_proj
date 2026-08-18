@@ -133,8 +133,14 @@ class SQLiteRateLimiter:
             "CREATE INDEX IF NOT EXISTS idx_attempts_key ON attempts(key)"
         )
         self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attempts_ts ON attempts(ts)"
+        )
+        self._conn.execute(
             "CREATE TABLE IF NOT EXISTS blocks ("
             "key TEXT PRIMARY KEY, blocked_until REAL NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_blocks_until ON blocks(blocked_until)"
         )
         self._conn.commit()
 
@@ -163,12 +169,18 @@ class SQLiteRateLimiter:
     def record_failure(self, key: str, now: float = None):
         now = now if now is not None else time.time()
         self._conn.execute("INSERT INTO attempts (key, ts) VALUES (?, ?)", (key, now))
+        # Deleted GLOBALLY (every key), not just this one: an attacker
+        # who rotates through many source addresses, each failing a few
+        # times but never enough to trip a block and never coming back,
+        # would otherwise leave permanent garbage rows behind for every
+        # address that never revisits - since this is a persistent file,
+        # not memory that resets, that garbage would accumulate forever
+        # and could exhaust disk space. Piggybacking the global sweep on
+        # every write keeps the file bounded without a background thread.
         # Same eviction rule as RateLimiter: an attempt exactly at the
         # window boundary (now - ts == window_seconds) still counts.
-        self._conn.execute(
-            "DELETE FROM attempts WHERE key = ? AND ts < ?",
-            (key, now - self.window_seconds),
-        )
+        self._conn.execute("DELETE FROM attempts WHERE ts < ?", (now - self.window_seconds,))
+        self._conn.execute("DELETE FROM blocks WHERE blocked_until <= ?", (now,))
         count = self._conn.execute(
             "SELECT COUNT(*) FROM attempts WHERE key = ?", (key,)
         ).fetchone()[0]

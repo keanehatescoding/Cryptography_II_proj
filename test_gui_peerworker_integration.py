@@ -13,6 +13,7 @@ Run with:  python3 -m pytest test_gui_peerworker_integration.py -v
 
 import queue
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -476,3 +477,36 @@ def test_history_write_failure_disables_history_without_killing_the_session(monk
     assert events[0]["kind"] == "status"
     assert events[0]["text"] == "Chat history disabled: No space left on device"
     assert events[0]["session_id"] == worker.session_id
+
+
+def test_host_worker_closes_its_rate_limiter_on_stop(tmp_path, monkeypatch):
+    """Regression test: PeerWorker.run() creates a SQLiteRateLimiter (for
+    role="host") but had no matching close() on any exit path - repeated
+    host workers over the app's lifetime would leak SQLite connections
+    and file handles. Confirmed by trying a query on the connection after
+    stop()+join(): a closed connection raises sqlite3.ProgrammingError."""
+    monkeypatch.setattr(gui, "KEY_DIR", str(tmp_path / "keys"))
+
+    port = _free_port()
+    worker = gui.PeerWorker("hostZ", "host", "127.0.0.1", port, queue.Queue())
+    _start_event_pump(worker, [])
+    worker.start()
+
+    assert _wait_for(lambda: worker._limiter is not None, timeout=5)
+    limiter = worker._limiter
+    limiter._conn.execute("SELECT 1")  # sanity: usable before stop()
+
+    worker.stop()
+    worker.join(timeout=5)
+
+    assert _wait_for(
+        lambda: _connection_is_closed(limiter._conn), timeout=5
+    ), "limiter's SQLite connection was never closed after the worker stopped"
+
+
+def _connection_is_closed(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute("SELECT 1")
+        return False
+    except sqlite3.ProgrammingError:
+        return True

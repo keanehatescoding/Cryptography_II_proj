@@ -380,6 +380,17 @@ class PeerWorker(threading.Thread):
                 self.emit("error", text=str(e))
                 return
 
+        try:
+            self._run_loop()
+        finally:
+            # Closed here, in the worker thread itself, on every exit
+            # path (including an exception) rather than from stop() -
+            # stop() runs on the GUI thread and could otherwise race an
+            # in-progress SQLite operation this thread is still doing.
+            if self._limiter is not None:
+                self._limiter.close()
+
+    def _run_loop(self):
         while not self._stop_event.is_set():
             try:
                 if self.role == "host":

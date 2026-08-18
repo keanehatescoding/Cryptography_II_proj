@@ -642,6 +642,46 @@ def test_sqlite_rate_limiter_window_aging_survives_a_simulated_restart(tmp_path)
     assert not restarted.is_blocked("1.2.3.4", now=t + 20)
 
 
+def test_sqlite_rate_limiter_sweeps_expired_rows_for_every_key_not_just_the_current_one(tmp_path):
+    """Regression test: an attacker who rotates through many source
+    addresses, each failing a few times (never enough to trip a block)
+    and never reconnecting, must not leave permanent garbage behind in
+    the persistent file for every address that never revisits - unlike
+    the in-memory RateLimiter, this file doesn't get wiped by a
+    restart, so unbounded per-key-only cleanup would let disk usage
+    grow forever. A single write for any one key must sweep expired
+    rows for every key, and expired blocks too."""
+    rl = SQLiteRateLimiter(str(tmp_path / "rl.db"), max_attempts=100, window_seconds=10.0, cooldown_seconds=5.0)
+    t = 1000.0
+
+    for i in range(50):
+        rl.record_failure(f"10.0.0.{i}", now=t)  # well under max_attempts=100, never blocks
+
+    count = rl._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+    assert count == 50
+
+    # advance well past the window, then a single new key's failure must
+    # sweep every one of those 50 other keys' now-expired rows too
+    rl.record_failure("10.0.0.999", now=t + 100)
+    count = rl._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+    assert count == 1, "expired attempts for OTHER keys should have been swept globally"
+
+    # same property for expired blocks: trip a real block, let its
+    # cooldown expire, and confirm a later unrelated write clears it.
+    # max_attempts=2 here so "5.6.7.8"'s own single failure below doesn't
+    # ALSO immediately trip its own new block, which would keep the
+    # count at 1 for the wrong reason and mask whether the sweep worked.
+    limiter2 = SQLiteRateLimiter(str(tmp_path / "rl2.db"), max_attempts=1, window_seconds=60.0, cooldown_seconds=5.0)
+    limiter2.record_failure("1.2.3.4", now=t)  # 1 attempt trips it immediately (max_attempts=1)
+    blocks_count = limiter2._conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+    assert blocks_count == 1
+
+    limiter2.max_attempts = 2
+    limiter2.record_failure("5.6.7.8", now=t + 100)  # cooldown (5s) long expired by now
+    blocks_count = limiter2._conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+    assert blocks_count == 0, "the expired block for 1.2.3.4 should have been swept too"
+
+
 def test_dh_ratchet_step_deterministic_and_distinct():
     root = b"\x10" * 32
     dh_output_a = b"\x20" * 32
