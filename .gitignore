@@ -3,6 +3,7 @@ demo_keys/
 received_files/
 *.pem
 *_history.enc
+*_ratelimit.db*
 __pycache__
 .venv
 secure_comms_audit.log

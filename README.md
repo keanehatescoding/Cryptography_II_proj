@@ -120,7 +120,17 @@ costs CPU (ECDH + signature verification) per attempt, so unlimited
 retries are a DoS vector regardless of whether the crypto itself holds up.
 `server.py` and the GUI's "Host" mode both loop on the listening socket
 so a legitimate peer isn't blocked out just because someone else's failed
-attempts came first.
+attempts came first. Both use `SQLiteRateLimiter`, a SQLite-file-backed
+sibling of the plain in-memory `RateLimiter` - state survives the app
+being closed and reopened (one file per identity, under `KEY_DIR`/`demo_keys`),
+so an attacker who trips the cooldown doesn't get a free reset just by
+waiting for (or forcing) a restart. This requires giving up the plain
+version's `time.monotonic()` clock for `time.time()`, since a monotonic
+timestamp from before a restart is meaningless to compare against the new
+process's monotonic clock - the same trade-off any persistent rate-limit
+store makes. It's still no substitute for a real firewall/WAF - both
+remain trivially bypassed by an attacker who can spoof or rotate source
+addresses; persistence only closes the "just restart the app" bypass.
 
 ## Files
 
@@ -358,8 +368,10 @@ transfers aren't recorded, only text messages.
   length but not the number of messages sent or their timing - a
   determined observer can still build a traffic profile from _when_ and
   _how often_ messages flow, even with every message the same size. The
-  rate limiter is also in-memory/per-process, so it resets on restart
-  and doesn't help if an attacker can rotate source addresses.
+  rate limiter (`SQLiteRateLimiter`, see "Handshake rate limiting" above)
+  now survives a restart, but still doesn't help if an attacker can
+  rotate source addresses, and isn't shared across multiple server
+  instances behind a load balancer.
 - Only the last few epochs' receiving chains are retained
   (`MAX_RETAINED_CHAINS`), so a message delayed across more than a
   couple of rekey boundaries will fail to decrypt with a clear error
