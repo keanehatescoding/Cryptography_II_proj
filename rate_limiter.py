@@ -43,7 +43,7 @@ class RateLimiter:
         self._failures: dict[str, deque] = defaultdict(deque)
         self._blocked_until: dict[str, float] = {}
 
-    def is_blocked(self, key: str, now: float = None) -> bool:
+    def is_blocked(self, key: str, now: float | None = None) -> bool:
         now = now if now is not None else time.monotonic()
         blocked_until = self._blocked_until.get(key)
         if blocked_until is None:
@@ -53,14 +53,14 @@ class RateLimiter:
             return False
         return True
 
-    def seconds_until_unblocked(self, key: str, now: float = None) -> float:
+    def seconds_until_unblocked(self, key: str, now: float | None = None) -> float:
         now = now if now is not None else time.monotonic()
         blocked_until = self._blocked_until.get(key)
         if blocked_until is None or now >= blocked_until:
             return 0.0
         return blocked_until - now
 
-    def record_failure(self, key: str, now: float = None):
+    def record_failure(self, key: str, now: float | None = None):
         now = now if now is not None else time.monotonic()
         attempts = self._failures[key]
         attempts.append(now)
@@ -144,7 +144,7 @@ class SQLiteRateLimiter:
         )
         self._conn.commit()
 
-    def is_blocked(self, key: str, now: float = None) -> bool:
+    def is_blocked(self, key: str, now: float | None = None) -> bool:
         now = now if now is not None else time.time()
         row = self._conn.execute(
             "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
@@ -157,7 +157,7 @@ class SQLiteRateLimiter:
             return False
         return True
 
-    def seconds_until_unblocked(self, key: str, now: float = None) -> float:
+    def seconds_until_unblocked(self, key: str, now: float | None = None) -> float:
         now = now if now is not None else time.time()
         row = self._conn.execute(
             "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
@@ -166,7 +166,7 @@ class SQLiteRateLimiter:
             return 0.0
         return row[0] - now
 
-    def record_failure(self, key: str, now: float = None):
+    def record_failure(self, key: str, now: float | None = None):
         now = now if now is not None else time.time()
         self._conn.execute("INSERT INTO attempts (key, ts) VALUES (?, ?)", (key, now))
         # Deleted GLOBALLY (every key), not just this one: an attacker
