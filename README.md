@@ -300,7 +300,24 @@ selected gets an unread-count badge on its label when a message arrives
 (even if the window itself is focused - you might just be looking at a
 different tab); the OS-level popup and window-title badge are reserved
 for when the whole window has lost focus, so switching tabs within a
-focused window doesn't also spam a desktop notification. Every
+focused window doesn't also spam a desktop notification.
+
+**Click-to-focus** works on Windows: clicking the native balloon
+notification (or the tray icon while it's still showing) brings the
+window to the front and switches straight to that message's tab. This
+needs a real Win32 message pump to detect the click - `_notify_windows`
+polls it non-blockingly for a few seconds after posting the balloon
+rather than just sleeping, since a plain sleep never processes the
+window's message queue and so could never see the click at all. macOS
+and Linux don't get this: `osascript display notification` has no
+click-callback mechanism whatsoever, and `notify-send` is a
+fire-and-forget CLI that hands the notification to a D-Bus daemon and
+exits immediately - actually receiving its reply would mean staying
+alive as a D-Bus listener, which needs a real D-Bus client library, not
+a dependency this project takes on for a nice-to-have. The audible bell,
+per-tab unread badge, and window-title badge remain the notification
+mechanism on those platforms, same as on Windows when a click doesn't
+happen. Every
 `PeerWorker` tags its events with a `session_id` so the shared events
 queue can be routed to the right tab (or, before a connection's first
 handshake completes, to the "New Connection" tab's own status/fingerprint

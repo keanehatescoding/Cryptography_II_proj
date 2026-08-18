@@ -136,13 +136,26 @@ def _unique_dest_path(directory: Path, name: str) -> Path:
         i += 1
 
 
-def _notify_desktop(title: str, message: str) -> None:
+def _notify_desktop(title: str, message: str, on_click=None) -> None:
     """Best-effort native OS notification for an incoming message.
 
     Deliberately dependency-free (uses whatever notifier ships with the
     OS) and deliberately swallows every error: a missing `notify-send`
     binary or a sandboxed/headless environment should never crash the
     chat session over a nice-to-have.
+
+    `on_click`, if given, is called (from a background thread - it must
+    be thread-safe and must NOT touch Tk widgets directly, see
+    SecureCommsApp._notify_incoming) when the user clicks the
+    notification. This is only honored on Windows: `osascript display
+    notification` (macOS) has no click-callback mechanism at all, and
+    `notify-send` (Linux) is a fire-and-forget CLI that hands the
+    notification to a D-Bus daemon and exits immediately - actually
+    receiving its `ActionInvoked` signal back would mean staying alive
+    as a D-Bus listener, which needs a real D-Bus client library (not a
+    dependency this project takes on for a nice-to-have). On both
+    platforms the audible bell, per-tab unread badge, and window-title
+    badge (see _notify_incoming) remain the notification mechanism.
     """
     try:
         system = platform.system()
@@ -169,12 +182,54 @@ def _notify_desktop(title: str, message: str) -> None:
             # No notify-send available (e.g. minimal WM/headless): the
             # audible bell + title badge still cover it.
         elif system == "Windows":
-            _notify_windows(title, message)
+            _notify_windows(title, message, on_click=on_click)
     except Exception:
         pass
 
 
-def _notify_windows(title: str, message: str) -> None:
+# Shared across every _notify_windows() call, not per-call state: a Win32
+# window CLASS's procedure (lpfnWndProc) is registered exactly once for
+# the whole process - RegisterClass() on an already-registered class name
+# fails and the ORIGINAL registration's procedure keeps handling every
+# window subsequently created with that class, including from later,
+# unrelated notifications (this is Win32 behavior, not a choice made
+# here - a class's WNDPROC can't be swapped out per-window without
+# SetWindowLongPtr-style subclassing). So the dispatcher itself must be a
+# single, stable function - not a closure captured fresh each call, which
+# would only ever really take effect for the very first notification -
+# and it resolves per-notification state via the hwnd every window
+# message carries, which IS unique per CreateWindow() call even though
+# the class and its procedure are shared.
+_win_notify_state: dict = {}
+_win_notify_state_lock = threading.Lock()
+_win_notify_class_registered = False
+_win_notify_class_lock = threading.Lock()
+
+# NIN_BALLOONUSERCLICK/NIN_BALLOONTIMEOUT aren't always exposed by
+# win32con, so given explicitly - they're fixed Windows Shell constants
+# (WM_USER+5 / WM_USER+4), not something that varies by pywin32 version.
+_NIN_BALLOONTIMEOUT_OFFSET = 4
+_NIN_BALLOONUSERCLICK_OFFSET = 5
+
+
+def _win_notify_wndproc(hwnd, msg, wparam, lparam):
+    import win32con  # ty:ignore[unresolved-import]
+
+    with _win_notify_state_lock:
+        state = _win_notify_state.get(hwnd)
+    if state is None:
+        return 0
+    if lparam in (win32con.WM_LBUTTONUP, win32con.WM_USER + _NIN_BALLOONUSERCLICK_OFFSET):
+        state["clicked"] = True
+        state["done"] = True
+    elif lparam == win32con.WM_USER + _NIN_BALLOONTIMEOUT_OFFSET:
+        # Windows itself dismissed the balloon (its own accessibility-
+        # driven timeout elapsed) - nothing to click anymore.
+        state["done"] = True
+    return 0
+
+
+def _notify_windows(title: str, message: str, on_click=None) -> None:
     """Native Windows balloon notification via pywin32's Shell_NotifyIcon.
 
     pywin32 is an optional dependency (not in requirements.txt), so the
@@ -183,9 +238,10 @@ def _notify_windows(title: str, message: str) -> None:
     should never crash the chat session over a nice-to-have.
 
     The whole register-window / add-icon / pop-balloon / tear-down
-    sequence runs on its own daemon thread because it needs a short
-    sleep to give the balloon time to actually appear before the icon
-    is removed, and that must never block the Tk main loop.
+    sequence runs on its own daemon thread because it needs to pump
+    messages until the balloon reaches a terminal state (clicked, or
+    dismissed by Windows) to actually be able to detect a click on it -
+    see below - and that must never block the Tk main loop.
     """
 
     def _show():
@@ -196,21 +252,26 @@ def _notify_windows(title: str, message: str) -> None:
         except ImportError:
             return
 
+        global _win_notify_class_registered
         try:
-            wc = win32gui.WNDCLASS()
-            wc.hInstance = win32api.GetModuleHandle(None)
-            wc.lpszClassName = "SecureCommsNotifyIcon"
-            wc.lpfnWndProc = {win32con.WM_DESTROY: lambda hwnd, msg, wparam, lparam: 0}
-
-            try:
-                class_atom = win32gui.RegisterClass(wc)
-            except win32gui.error:
-                # Already registered by an earlier notification in this
-                # process - reuse the class name instead of failing.
-                class_atom = wc.lpszClassName
+            with _win_notify_class_lock:
+                if not _win_notify_class_registered:
+                    wc = win32gui.WNDCLASS()
+                    wc.hInstance = win32api.GetModuleHandle(None)
+                    wc.lpszClassName = "SecureCommsNotifyIcon"
+                    wc.lpfnWndProc = {
+                        win32con.WM_DESTROY: lambda hwnd, msg, wparam, lparam: 0,
+                        win32con.WM_USER + 20: _win_notify_wndproc,
+                    }
+                    try:
+                        win32gui.RegisterClass(wc)
+                    except win32gui.error:
+                        pass  # registered by a racing call - fine, same class either way
+                    _win_notify_class_registered = True
+                h_instance = win32api.GetModuleHandle(None)
 
             hwnd = win32gui.CreateWindow(
-                class_atom,
+                "SecureCommsNotifyIcon",
                 "SecureCommsNotifyWindow",
                 0,
                 0,
@@ -219,12 +280,16 @@ def _notify_windows(title: str, message: str) -> None:
                 0,
                 0,
                 0,
-                wc.hInstance,
+                h_instance,
                 None,
             )
             win32gui.UpdateWindow(hwnd)
         except Exception:
             return
+
+        state = {"clicked": False, "done": False}
+        with _win_notify_state_lock:
+            _win_notify_state[hwnd] = state
 
         try:
             hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
@@ -248,13 +313,25 @@ def _notify_windows(title: str, message: str) -> None:
                     win32gui.NIIF_INFO,
                 ),
             )
-            # The balloon pop is asynchronous; hold the tray icon around
-            # long enough for Windows to actually display it before we
-            # clean up, or it can get dropped silently.
-            time.sleep(4)
+            # uTimeout (the "200" above) is ignored on Vista+ - Windows
+            # uses its own accessibility-driven duration instead, which
+            # can outlast a short fixed wait here. Rather than guess at
+            # that duration, pump messages until a terminal event
+            # (NIN_BALLOONUSERCLICK or NIN_BALLOONTIMEOUT) says the
+            # balloon is actually gone, with a generous bounded fallback
+            # in case neither ever arrives (e.g. focus assist silently
+            # suppressing it) so this thread can't hang indefinitely.
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline and not state["done"]:
+                win32gui.PumpWaitingMessages()
+                time.sleep(0.05)
+            if state["clicked"] and on_click is not None:
+                on_click()
         except Exception:
             pass
         finally:
+            with _win_notify_state_lock:
+                _win_notify_state.pop(hwnd, None)
             try:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
             except Exception:
@@ -1295,7 +1372,18 @@ class SecureCommsApp(tk.Tk):
         self._unread_count += 1
         self.title(f"({self._unread_count}) {self._base_title} - new message")
         preview = text if len(text) <= 80 else text[:77] + "..."
-        _notify_desktop(f"New message from {sender}", preview)
+        # The click callback (Windows only - see _notify_desktop) fires
+        # on a background thread, so it must not touch Tk widgets
+        # directly; queuing a "focus_requested" event reuses the same
+        # thread-safe hand-off every PeerWorker already uses to talk to
+        # the GUI thread, rather than inventing a second mechanism.
+        _notify_desktop(
+            f"New message from {sender}",
+            preview,
+            on_click=lambda: self.events.put(
+                {"kind": "focus_requested", "session_id": session_id}
+            ),
+        )
 
     # -- event loop --------------------------------------------------------
 
@@ -1398,6 +1486,20 @@ class SecureCommsApp(tk.Tk):
                 return
             self._log(tab, ev["text"], "peer", label=ev["sender"])
             self._notify_incoming(session_id, tab, ev["sender"], ev["text"])
+        elif kind == "focus_requested":
+            # Only reachable today via a click on a native Windows
+            # balloon notification (see _notify_desktop) - selects that
+            # message's tab and brings the window to the front. A stale
+            # click (the session was disconnected in the meantime) has
+            # no tab to select - ignore it rather than popping the
+            # window up for no reason.
+            tab = self.sessions.get(session_id)
+            if tab is None:
+                return
+            self.notebook.select(tab)
+            self.deiconify()
+            self.lift()
+            self.focus_force()
         elif kind == "security_alert":
             tab = self.sessions.get(session_id)
             if tab is not None:
