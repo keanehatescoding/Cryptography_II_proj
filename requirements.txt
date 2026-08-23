@@ -1,4 +1,4 @@
-cryptography>=42.0
+cryptography>=46.0.5
 pytest>=8.0
 
 # Optional: enables a native balloon notification for incoming messages
