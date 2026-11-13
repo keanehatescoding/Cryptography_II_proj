@@ -931,6 +931,13 @@ def test_padding_rejects_too_short_input():
         padding.unpad(b"ab")  # shorter than the 4-byte length prefix
 
 
+def test_padding_rejects_nonzero_padding_bytes():
+    padded = bytearray(padding.pad(b"hello"))
+    padded[-1] = 1
+    with pytest.raises(padding.PaddingError):
+        padding.unpad(bytes(padded))
+
+
 def test_secure_channel_ciphertext_length_hides_plaintext_length():
     """Integration check: two different-length plaintexts within the
     same padding bucket produce equal-length ciphertexts over the real

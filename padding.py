@@ -60,6 +60,10 @@ def unpad(padded: bytes) -> bytes:
             "Encoded length exceeds the padded message size - corrupt or "
             "tampered padding."
         )
+    if any(b != 0 for b in padded[end:]):
+        raise PaddingError(
+            "Padding bytes are not all zero - corrupt or tampered padding."
+        )
     return padded[LENGTH_PREFIX_SIZE:end]
 
 
