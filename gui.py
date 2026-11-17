@@ -756,6 +756,16 @@ class PeerWorker(threading.Thread):
                 text="Too many simultaneous incoming file transfers; refusing.",
             )
             return
+        if file_id in self._inbound_transfers:
+            # Reusing the id of a transfer that's still in flight would
+            # overwrite its entry: the previously opened handle would leak
+            # (never closed) and chunks from the two transfers would
+            # interleave into the wrong file. Refuse the duplicate instead.
+            self.emit(
+                "security_alert",
+                text="Peer reused an in-flight file transfer id; refusing.",
+            )
+            return
 
         FILE_RECV_DIR.mkdir(parents=True, exist_ok=True)
         dest = _unique_dest_path(FILE_RECV_DIR, name)
