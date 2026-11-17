@@ -160,6 +160,44 @@ def test_too_many_concurrent_inbound_transfers_is_refused(tmp_path, monkeypatch)
     worker._abort_inbound_transfers()  # close the handles this test opened
 
 
+def test_duplicate_in_flight_file_offer_is_rejected(tmp_path, monkeypatch):
+    """A peer reusing the id of a transfer that's still in flight must not
+    overwrite the tracked entry: that would leak the first transfer's open
+    handle and let chunks from the two transfers interleave into the wrong
+    file. Refuse the second offer and keep the original transfer intact."""
+    worker = make_worker(tmp_path, monkeypatch)
+    file_id = b"0123456789abcdef"
+    content = b"payload" * 20
+    sha256_hex = hashlib.sha256(content).hexdigest()
+
+    worker._handle_plaintext(
+        gui._encode_file_offer(file_id, "first.bin", len(content), sha256_hex)
+    )
+    original = worker._inbound_transfers[file_id]
+    drain(worker)
+
+    worker._handle_plaintext(
+        gui._encode_file_offer(file_id, "second.bin", len(content), sha256_hex)
+    )
+
+    events = drain(worker)
+    assert events == [
+        {
+            "kind": "security_alert",
+            "text": "Peer reused an in-flight file transfer id; refusing.",
+        }
+    ]
+    assert worker._inbound_transfers[file_id] is original
+    assert not (tmp_path / "second.bin").exists()
+
+    # The original transfer must still complete after the rejected
+    # duplicate - its handle was never closed or replaced.
+    worker._handle_plaintext(gui._encode_file_chunk(file_id, content))
+    events = drain(worker)
+    assert events[-1]["kind"] == "file_received"
+    assert (tmp_path / "first.bin").read_bytes() == content
+
+
 def test_chunk_with_no_matching_offer_is_dropped_silently(tmp_path, monkeypatch):
     worker = make_worker(tmp_path, monkeypatch)
     worker._handle_plaintext(gui._encode_file_chunk(b"0123456789abcdef", b"stray data"))
