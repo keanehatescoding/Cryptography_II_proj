@@ -41,6 +41,16 @@ def load_or_create_identity(name: str) -> Identity:
         if use_pass != "n":
             passphrase = getpass.getpass("New passphrase: ")
             confirm = getpass.getpass("Confirm passphrase: ")
+            if not passphrase:
+                # An empty passphrase would be coerced to None by
+                # `passphrase or None` below and silently write an
+                # UNENCRYPTED key while the user believes they opted into
+                # encryption. Refuse instead.
+                print(
+                    "Passphrase cannot be empty - refusing to create an "
+                    "unencrypted identity. Aborting."
+                )
+                sys.exit(1)
             if passphrase != confirm:
                 print("Passphrases did not match. Aborting.")
                 sys.exit(1)
@@ -53,7 +63,10 @@ def load_or_create_identity(name: str) -> Identity:
             passphrase = getpass.getpass(f"Passphrase for '{name}': ")
             try:
                 return Identity.load(name, KEY_DIR, passphrase=passphrase)
-            except ValueError:
+            except (ValueError, TypeError):
+                # ValueError: wrong passphrase. TypeError: empty/absent
+                # passphrase for an encrypted key - both should re-prompt,
+                # not crash with a traceback (see Identity.load's docstring).
                 print("Incorrect passphrase.")
         print("Too many incorrect attempts. Aborting.")
         sys.exit(1)
