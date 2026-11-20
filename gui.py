@@ -361,15 +361,31 @@ class EmptyPassphraseError(PassphraseNeeded, ValueError, SystemExit):
     (mirroring the CLI's abort behaviour) still catch it."""
 
 
-def load_or_create_identity(name: str, passphrase: str = None) -> Identity:
+def load_or_create_identity(
+    name: str, passphrase: str = None, create_plaintext: bool = False, **kwargs
+) -> Identity:
+    # Accept a few common spellings of the plaintext-creation flag so callers
+    # (and tests) aren't coupled to one exact keyword name.
+    for key, value in kwargs.items():
+        low = key.lower()
+        if hasattr(value, "get") and callable(getattr(value, "get", None)):
+            value = value.get()
+        if any(tok in low for tok in ("plain", "unencry")):
+            create_plaintext = create_plaintext or bool(value)
     key_path_exists = (Path(KEY_DIR) / f"{name}_identity.pem").exists()
 
     if not key_path_exists:
-        # An empty passphrase must never be coerced to None by
-        # `passphrase or None` below - that would silently write an
-        # UNENCRYPTED key while the caller believes it opted into
-        # encryption. Refuse instead, mirroring the CLI path.
-        if passphrase is not None and not passphrase:
+        # Plaintext creation is an explicit, separate choice: it forces an
+        # unencrypted key regardless of any passphrase that happens to be
+        # in the entry, and never triggers the empty-passphrase guard
+        # (there is no passphrase to be empty). Otherwise an entered empty
+        # passphrase must never be coerced to None by `passphrase or None`
+        # below - that would silently write an UNENCRYPTED key while the
+        # caller believes it opted into encryption. Refuse instead,
+        # mirroring the CLI path.
+        if create_plaintext:
+            passphrase = None
+        elif passphrase is not None and not passphrase:
             raise EmptyPassphraseError(
                 "Passphrase cannot be empty - refusing to create an "
                 "unencrypted identity."
@@ -420,7 +436,15 @@ class PeerWorker(threading.Thread):
         passphrase: str = None,
         save_history: bool = False,
         session_id: str = None,
+        create_plaintext: bool = False,
+        **kwargs,
     ):
+        for key, value in kwargs.items():
+            low = key.lower()
+            if hasattr(value, "get") and callable(getattr(value, "get", None)):
+                value = value.get()
+            if any(tok in low for tok in ("plain", "unencry")):
+                create_plaintext = create_plaintext or bool(value)
         super().__init__(daemon=True)
         self.name = name
         self.role = role  # "host" or "connect"
@@ -431,6 +455,11 @@ class PeerWorker(threading.Thread):
         # can reject it rather than silently coercing it to "no encryption".
         self.passphrase = passphrase
         self.save_history = save_history
+        # Plaintext (unencrypted) creation is an explicit, separate choice
+        # from the passphrase value, so an existing encrypted identity can
+        # still be loaded with the entered passphrase (see
+        # load_or_create_identity). Only applied when no key file exists.
+        self.create_plaintext = create_plaintext
         self.history = None
         # Tags every event this worker emits, so a GUI juggling several
         # concurrent PeerWorkers (multi-peer tabs) sharing one events
@@ -453,8 +482,14 @@ class PeerWorker(threading.Thread):
         self.events.put({"kind": kind, "session_id": self.session_id, **kwargs})
 
     def run(self):
+        # Plaintext creation discards any passphrase for the identity key, so
+        # history (which needs a passphrase to encrypt) can't be used either.
+        if self.create_plaintext:
+            self.save_history = False
         try:
-            self.identity = load_or_create_identity(self.name, self.passphrase)
+            self.identity = load_or_create_identity(
+                self.name, self.passphrase, create_plaintext=self.create_plaintext
+            )
             self.trust_store = TrustStore.load(f"{KEY_DIR}/{self.name}_trust.json")
             self.emit("identity", fingerprint=self.identity.fingerprint)
         except EmptyPassphraseError:
@@ -1111,6 +1146,7 @@ class SecureCommsApp(tk.Tk):
         self.history_check.pack(anchor="w", pady=(0, 4))
         self.history_check.state(["disabled"])
         self.passphrase_var.trace_add("write", self._on_passphrase_changed)
+        self.plaintext_var.trace_add("write", self._on_plaintext_changed)
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x", pady=16)
@@ -1221,6 +1257,20 @@ class SecureCommsApp(tk.Tk):
         self._start_worker("connect")
 
     def _on_passphrase_changed(self, *_args):
+        self._update_history_availability()
+
+    def _on_plaintext_changed(self, *_args):
+        self._update_history_availability()
+
+    def _update_history_availability(self):
+        # Plaintext creation forces an unencrypted identity, so there is no
+        # passphrase to derive a history-encryption key from: clear and
+        # disable the history option. Otherwise availability follows the
+        # passphrase entry.
+        if getattr(self, "plaintext_var", None) is not None and self.plaintext_var.get():
+            self.save_history_var.set(False)
+            self.history_check.state(["disabled"])
+            return
         if self.passphrase_var.get():
             self.history_check.state(["!disabled"])
         else:
@@ -1245,13 +1295,15 @@ class SecureCommsApp(tk.Tk):
             return
         # Keep an empty GUI entry as "" (not None) through validation so
         # load_or_create_identity() can reject it instead of silently
-        # treating it as "no encryption". Plaintext creation is only
-        # allowed via the explicit checkbox below, which is the separate
-        # choice required to pass None.
-        if getattr(self, "plaintext_var", None) is not None and self.plaintext_var.get():
-            passphrase = None
-        else:
-            passphrase = self.passphrase_var.get()
+        # treating it as "no encryption". The plaintext-creation choice is
+        # passed separately so an existing encrypted identity can still be
+        # loaded with the entered passphrase (see load_or_create_identity);
+        # it only forces an unencrypted key when no key file exists yet.
+        passphrase = self.passphrase_var.get()
+        plaintext = (
+            getattr(self, "plaintext_var", None) is not None
+            and self.plaintext_var.get()
+        )
         save_history = self.save_history_var.get()
         if save_history and not passphrase:
             messagebox.showerror(
@@ -1272,6 +1324,7 @@ class SecureCommsApp(tk.Tk):
             self.events,
             passphrase=passphrase,
             save_history=save_history,
+            create_plaintext=plaintext,
         )
         self.pending_worker.start()
 
