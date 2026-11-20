@@ -1088,11 +1088,19 @@ class SecureCommsApp(tk.Tk):
         )
         ttk.Label(
             frame,
-            text="Leave blank for a new/unencrypted identity. Required "
-            "if this name's identity key is passphrase-protected.",
+            text="Passphrase (required to create a new encrypted identity; "
+            "leave blank only to load an existing unencrypted one).",
             foreground="#888",
             font=("", 8),
         ).pack(anchor="w", pady=(0, 4))
+
+        self.plaintext_var = tk.BooleanVar(value=False)
+        self.plaintext_check = ttk.Checkbutton(
+            frame,
+            text="Create an unencrypted (plaintext) identity instead",
+            variable=self.plaintext_var,
+        )
+        self.plaintext_check.pack(anchor="w", pady=(0, 4))
 
         self.save_history_var = tk.BooleanVar(value=False)
         self.history_check = ttk.Checkbutton(
@@ -1235,7 +1243,15 @@ class SecureCommsApp(tk.Tk):
         if not name:
             messagebox.showerror("Missing name", "Please enter your name.")
             return
-        passphrase = self.passphrase_var.get() or None
+        # Keep an empty GUI entry as "" (not None) through validation so
+        # load_or_create_identity() can reject it instead of silently
+        # treating it as "no encryption". Plaintext creation is only
+        # allowed via the explicit checkbox below, which is the separate
+        # choice required to pass None.
+        if getattr(self, "plaintext_var", None) is not None and self.plaintext_var.get():
+            passphrase = None
+        else:
+            passphrase = self.passphrase_var.get()
         save_history = self.save_history_var.get()
         if save_history and not passphrase:
             messagebox.showerror(
