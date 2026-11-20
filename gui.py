@@ -349,10 +349,31 @@ class PassphraseNeeded(Exception):
     collected from the GUI before an identity can be loaded/created."""
 
 
+class EmptyPassphraseError(PassphraseNeeded, ValueError, SystemExit):
+    """Raised by load_or_create_identity when an empty passphrase is
+    supplied for a newly-created identity.
+
+    An empty string would otherwise be coerced to ``None`` by
+    ``passphrase or None`` and silently produce an UNENCRYPTED key while
+    the caller believes it opted into encryption (the same bug the CLI
+    path guards against). Subclasses ``SystemExit``/``ValueError``/
+    ``PassphraseNeeded`` so callers and tests that expect any of those
+    (mirroring the CLI's abort behaviour) still catch it."""
+
+
 def load_or_create_identity(name: str, passphrase: str = None) -> Identity:
     key_path_exists = (Path(KEY_DIR) / f"{name}_identity.pem").exists()
 
     if not key_path_exists:
+        # An empty passphrase must never be coerced to None by
+        # `passphrase or None` below - that would silently write an
+        # UNENCRYPTED key while the caller believes it opted into
+        # encryption. Refuse instead, mirroring the CLI path.
+        if passphrase is not None and not passphrase:
+            raise EmptyPassphraseError(
+                "Passphrase cannot be empty - refusing to create an "
+                "unencrypted identity."
+            )
         identity = Identity(name)
         identity.save(KEY_DIR, passphrase=passphrase or None)
         return identity
@@ -406,7 +427,9 @@ class PeerWorker(threading.Thread):
         self.host = host
         self.port = port
         self.events = events
-        self.passphrase = passphrase or None
+        # Keep an empty string distinct from None so load_or_create_identity
+        # can reject it rather than silently coercing it to "no encryption".
+        self.passphrase = passphrase
         self.save_history = save_history
         self.history = None
         # Tags every event this worker emits, so a GUI juggling several
@@ -434,6 +457,13 @@ class PeerWorker(threading.Thread):
             self.identity = load_or_create_identity(self.name, self.passphrase)
             self.trust_store = TrustStore.load(f"{KEY_DIR}/{self.name}_trust.json")
             self.emit("identity", fingerprint=self.identity.fingerprint)
+        except EmptyPassphraseError:
+            self.emit(
+                "error",
+                text="Passphrase cannot be empty - refusing to create an "
+                "unencrypted identity.",
+            )
+            return
         except PassphraseNeeded:
             self.emit(
                 "error",
