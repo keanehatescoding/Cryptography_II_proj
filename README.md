@@ -325,9 +325,11 @@ display - only one connection attempt can be *pending* at a time, though
 any number of already-established ones can run concurrently).
 
 The optional **Passphrase** field encrypts a newly-created identity key,
-or unlocks an existing encrypted one - leave it blank for a brand-new
-unencrypted identity. A wrong passphrase surfaces as a plain error
-dialog rather than crashing the app.
+or unlocks an existing encrypted one. An empty passphrase is rejected for
+a new identity (it would otherwise silently produce an unencrypted key);
+use the "Create an unencrypted (plaintext) identity instead" checkbox
+to opt into a plaintext identity explicitly. A wrong passphrase surfaces
+as a plain error dialog rather than crashing the app.
 
 **File transfer**: the "Send File…" button sends any local file through
 the same encrypted channel as chat messages. Large files are split into
