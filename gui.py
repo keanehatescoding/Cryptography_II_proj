@@ -746,8 +746,9 @@ class PeerWorker(threading.Thread):
             if not self._ask_trust(peer_name, fp):
                 self.sock.close()
                 raise HandshakeError(f"Declined to trust '{peer_name}'.")
-            self.trust_store.pin(peer_name, peer_pub)
-            self.trust_store.save(f"{KEY_DIR}/{self.name}_trust.json")
+            self.trust_store.pin_and_save(
+                peer_name, peer_pub, f"{KEY_DIR}/{self.name}_trust.json"
+            )
             self.emit("status", text=f"Pinned new identity '{peer_name}' ({fp})")
         elif not self.trust_store.is_trusted(peer_name, peer_pub):
             self.emit(

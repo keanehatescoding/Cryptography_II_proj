@@ -23,6 +23,7 @@ DoS-mitigation solution.
 """
 
 import sqlite3
+import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -119,6 +120,7 @@ class SQLiteRateLimiter:
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
         self.cooldown_seconds = cooldown_seconds
+        self._lock = threading.Lock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         # WAL + a busy timeout so a second process/thread hitting this
@@ -146,65 +148,69 @@ class SQLiteRateLimiter:
 
     def is_blocked(self, key: str, now: float | None = None) -> bool:
         now = now if now is not None else time.time()
-        row = self._conn.execute(
-            "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
-        ).fetchone()
-        if row is None:
-            return False
-        if now >= row[0]:
-            self._conn.execute("DELETE FROM blocks WHERE key = ?", (key,))
-            self._conn.commit()
-            return False
-        return True
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return False
+            if now >= row[0]:
+                self._conn.execute("DELETE FROM blocks WHERE key = ?", (key,))
+                self._conn.commit()
+                return False
+            return True
 
     def seconds_until_unblocked(self, key: str, now: float | None = None) -> float:
         now = now if now is not None else time.time()
-        row = self._conn.execute(
-            "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
-        ).fetchone()
-        if row is None or now >= row[0]:
-            return 0.0
-        return row[0] - now
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None or now >= row[0]:
+                return 0.0
+            return row[0] - now
 
     def record_failure(self, key: str, now: float | None = None):
         now = now if now is not None else time.time()
-        self._conn.execute("INSERT INTO attempts (key, ts) VALUES (?, ?)", (key, now))
-        # Deleted GLOBALLY (every key), not just this one: an attacker
-        # who rotates through many source addresses, each failing a few
-        # times but never enough to trip a block and never coming back,
-        # would otherwise leave permanent garbage rows behind for every
-        # address that never revisits - since this is a persistent file,
-        # not memory that resets, that garbage would accumulate forever
-        # and could exhaust disk space. Piggybacking the global sweep on
-        # every write keeps the file bounded without a background thread.
-        # Same eviction rule as RateLimiter: an attempt exactly at the
-        # window boundary (now - ts == window_seconds) still counts.
-        self._conn.execute("DELETE FROM attempts WHERE ts < ?", (now - self.window_seconds,))
-        self._conn.execute("DELETE FROM blocks WHERE blocked_until <= ?", (now,))
-        count = self._conn.execute(
-            "SELECT COUNT(*) FROM attempts WHERE key = ?", (key,)
-        ).fetchone()[0]
-        if count >= self.max_attempts:
-            self._conn.execute(
-                "INSERT INTO blocks (key, blocked_until) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET blocked_until = excluded.blocked_until",
-                (key, now + self.cooldown_seconds),
-            )
-            security_logger.security(
-                EventCode.RATE_LIMIT_TRIGGERED,
-                "rate limit triggered - too many failed attempts",
-                key=key,
-                attempts=count,
-                window_seconds=self.window_seconds,
-                cooldown_seconds=self.cooldown_seconds,
-            )
-            self._conn.execute("DELETE FROM attempts WHERE key = ?", (key,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("INSERT INTO attempts (key, ts) VALUES (?, ?)", (key, now))
+            # Deleted GLOBALLY (every key), not just this one: an attacker
+            # who rotates through many source addresses, each failing a few
+            # times but never enough to trip a block and never coming back,
+            # would otherwise leave permanent garbage rows behind for every
+            # address that never revisits - since this is a persistent file,
+            # not memory that resets, that garbage would accumulate forever
+            # and could exhaust disk space. Piggybacking the global sweep on
+            # every write keeps the file bounded without a background thread.
+            # Same eviction rule as RateLimiter: an attempt exactly at the
+            # window boundary (now - ts == window_seconds) still counts.
+            self._conn.execute("DELETE FROM attempts WHERE ts < ?", (now - self.window_seconds,))
+            self._conn.execute("DELETE FROM blocks WHERE blocked_until <= ?", (now,))
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM attempts WHERE key = ?", (key,)
+            ).fetchone()[0]
+            if count >= self.max_attempts:
+                self._conn.execute(
+                    "INSERT INTO blocks (key, blocked_until) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET blocked_until = excluded.blocked_until",
+                    (key, now + self.cooldown_seconds),
+                )
+                security_logger.security(
+                    EventCode.RATE_LIMIT_TRIGGERED,
+                    "rate limit triggered - too many failed attempts",
+                    key=key,
+                    attempts=count,
+                    window_seconds=self.window_seconds,
+                    cooldown_seconds=self.cooldown_seconds,
+                )
+                self._conn.execute("DELETE FROM attempts WHERE key = ?", (key,))
+            self._conn.commit()
 
     def record_success(self, key: str):
-        self._conn.execute("DELETE FROM attempts WHERE key = ?", (key,))
-        self._conn.execute("DELETE FROM blocks WHERE key = ?", (key,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM attempts WHERE key = ?", (key,))
+            self._conn.execute("DELETE FROM blocks WHERE key = ?", (key,))
+            self._conn.commit()
 
     def close(self):
         self._conn.close()

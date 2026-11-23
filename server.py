@@ -11,6 +11,7 @@ Usage:
 """
 
 import getpass
+import queue
 import socket
 import sys
 import threading
@@ -79,17 +80,100 @@ def load_or_create_identity(name: str) -> Identity:
     return Identity.load(name, KEY_DIR)
 
 
+class ConsoleDispatcher:
+    """Single owner for all terminal input. Handler threads submit input
+    requests (TOFU confirmations, chat replies) and wait for the response,
+    so concurrent connections cannot race on input() or misroute replies."""
+
+    def __init__(self):
+        self._requests = queue.Queue()
+        self._lock = threading.Lock()
+        self._peers = {}  # peer_name -> send function
+
+    def register_peer(self, peer_name, send_fn):
+        with self._lock:
+            self._peers[peer_name] = send_fn
+
+    def unregister_peer(self, peer_name):
+        with self._lock:
+            self._peers.pop(peer_name, None)
+
+    def request_input(self, prompt: str) -> str:
+        response = {}
+        event = threading.Event()
+        self._requests.put(("input", prompt, response, event))
+        event.wait()
+        return response.get("value", "")
+
+    def request_reply(self, peer_name: str, message: str):
+        self._requests.put(("reply", peer_name, message))
+
+    def print(self, text: str):
+        with self._lock:
+            print(text)
+
+    def run(self):
+        while True:
+            kind, *args = self._requests.get()
+            if kind == "stop":
+                return
+            if kind == "input":
+                prompt, response, event = args
+                try:
+                    response["value"] = input(prompt)
+                except EOFError:
+                    response["value"] = ""
+                finally:
+                    event.set()
+            elif kind == "reply":
+                peer_name, message = args
+                self.print(f"[{peer_name}] {message}")
+                with self._lock:
+                    send_fn = self._peers.get(peer_name)
+                if send_fn is None:
+                    self.print(f"[bob] peer '{peer_name}' disconnected; dropping reply prompt.")
+                    continue
+                try:
+                    reply = input(f"[bob -> {peer_name}] > ")
+                except EOFError:
+                    reply = "/quit"
+                try:
+                    send_fn(reply)
+                except Exception as e:
+                    self.print(f"[bob] failed to send reply to '{peer_name}': {e}")
+
+    def stop(self):
+        self._requests.put(("stop",))
+
+
+HANDSHAKE_TIMEOUT = 30.0
+MAX_CONCURRENT_HANDLERS = 16
+
+
 def handle_connection(
-    conn, addr, me: Identity, trust_store: TrustStore, limiter: SQLiteRateLimiter
+    conn,
+    addr,
+    me: Identity,
+    trust_store: TrustStore,
+    limiter: SQLiteRateLimiter,
+    console: ConsoleDispatcher,
+    handler_slots: threading.Semaphore,
 ):
     ip = addr[0]
+    peer_name = None
     try:
+        conn.settimeout(HANDSHAKE_TIMEOUT)
         # --- TOFU: on first contact, learn and pin the peer's public key ---
         peer_intro = transport.recv_json(conn)
         peer_name = peer_intro["name"]
         peer_pubkey = bytes.fromhex(peer_intro["identity_pub"])
         trusted, mismatch = trust_store.verify_and_pin_interactive(
-            peer_name, peer_pubkey, "bob", f"{KEY_DIR}/bob_trust.json"
+            peer_name,
+            peer_pubkey,
+            "bob",
+            f"{KEY_DIR}/bob_trust.json",
+            input_fn=console.request_input,
+            print_fn=console.print,
         )
         if not trusted:
             # Only a key mismatch (possible impersonation) counts against
@@ -110,34 +194,43 @@ def handle_connection(
         msg3 = HandshakeMessage3.from_wire(transport.recv_json(conn))
         channel = responder_finish(trust_store, state, msg3)
         limiter.record_success(ip)
+        conn.settimeout(None)
 
-        print("[bob] handshake complete - mutual authentication succeeded.")
-        print("[bob] session secured with AES-256-GCM. Type messages below.\n")
+        console.print("[bob] handshake complete - mutual authentication succeeded.")
+        console.print(f"[bob] session secured with {peer_name}. Type replies when prompted.\n")
 
-        # --- Encrypted chat loop ---
-        while True:
-            framed = transport.recv_bytes(conn)
-            try:
-                plaintext = channel.decrypt(framed)
-            except (ReplayError, TamperError) as e:
-                print(f"[bob] SECURITY ALERT: {e}")
-                continue
-            text = plaintext.decode("utf-8")
-            print(f"[{peer_name}] {text}")
-            if text.strip().lower() == "/quit":
-                break
-            reply = input("[bob] > ")
-            transport.send_bytes(conn, channel.encrypt(reply.encode("utf-8")))
-            if reply.strip().lower() == "/quit":
-                break
+        send_lock = threading.Lock()
+
+        def send_reply(reply: str):
+            with send_lock:
+                transport.send_bytes(conn, channel.encrypt(reply.encode("utf-8")))
+
+        console.register_peer(peer_name, send_reply)
+        try:
+            # --- Encrypted chat loop ---
+            while True:
+                framed = transport.recv_bytes(conn)
+                try:
+                    plaintext = channel.decrypt(framed)
+                except (ReplayError, TamperError) as e:
+                    console.print(f"[bob] SECURITY ALERT: {e}")
+                    continue
+                text = plaintext.decode("utf-8")
+                if text.strip().lower() == "/quit":
+                    console.print(f"[{peer_name}] {text}")
+                    break
+                console.request_reply(peer_name, text)
+        finally:
+            console.unregister_peer(peer_name)
 
     except HandshakeError as e:
-        print(f"[bob] HANDSHAKE FAILED: {e}")
+        console.print(f"[bob] HANDSHAKE FAILED: {e}")
         limiter.record_failure(ip)
-    except (ConnectionError, OSError) as e:
-        print(f"[bob] connection error: {e}")
+    except (ConnectionError, OSError, socket.timeout) as e:
+        console.print(f"[bob] connection error: {e}")
     finally:
         conn.close()
+        handler_slots.release()
 
 
 def main():
@@ -160,24 +253,43 @@ def main():
     srv.listen(5)
     print(f"[bob] listening on {HOST}:{PORT} - Ctrl+C to stop.")
 
+    console = ConsoleDispatcher()
+    handler_slots = threading.Semaphore(MAX_CONCURRENT_HANDLERS)
+
+    def accept_loop():
+        try:
+            while True:
+                try:
+                    conn, addr = srv.accept()
+                except OSError:
+                    break
+                ip = addr[0]
+                if limiter.is_blocked(ip):
+                    wait = limiter.seconds_until_unblocked(ip)
+                    console.print(
+                        f"[bob] rejecting {ip} - rate-limited for another "
+                        f"{wait:.0f}s after repeated failed attempts."
+                    )
+                    conn.close()
+                    continue
+                if not handler_slots.acquire(timeout=0.1):
+                    console.print(
+                        f"[bob] rejecting {ip} - too many concurrent connections."
+                    )
+                    conn.close()
+                    continue
+                console.print(f"[bob] connection from {addr}")
+                threading.Thread(
+                    target=handle_connection,
+                    args=(conn, addr, me, trust_store, limiter, console, handler_slots),
+                    daemon=True,
+                ).start()
+        finally:
+            console.stop()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
     try:
-        while True:
-            conn, addr = srv.accept()
-            ip = addr[0]
-            if limiter.is_blocked(ip):
-                wait = limiter.seconds_until_unblocked(ip)
-                print(
-                    f"[bob] rejecting {ip} - rate-limited for another "
-                    f"{wait:.0f}s after repeated failed attempts."
-                )
-                conn.close()
-                continue
-            print(f"[bob] connection from {addr}")
-            threading.Thread(
-                target=handle_connection,
-                args=(conn, addr, me, trust_store, limiter),
-                daemon=True,
-            ).start()
+        console.run()
     except KeyboardInterrupt:
         print("\n[bob] shutting down.")
     finally:

@@ -13,6 +13,7 @@ be authenticated.
 
 import json
 import os
+import threading
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -104,8 +105,15 @@ class Identity:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=encryption,
         )
-        key_path.write_bytes(pem)
-        os.chmod(key_path, 0o600)
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem)
+                fd = -1
+        finally:
+            if fd != -1:
+                os.close(fd)
         return str(key_path)
 
     @classmethod
@@ -146,14 +154,9 @@ class TrustStore:
 
     def __init__(self):
         self._trusted = {}  # name -> raw public key bytes
+        self._lock = threading.Lock()
 
-    def pin(self, name: str, public_bytes: bytes):
-        """Pin `name` to `public_bytes`. Safe to call repeatedly with the
-        same key (a no-op past the first time). Raises
-        IdentityMismatchError if `name` is already pinned to a
-        DIFFERENT key - callers must not treat that as routine and
-        silently move on; use repin() if the change has actually been
-        verified out-of-band."""
+    def _pin_unlocked(self, name: str, public_bytes: bytes):
         existing = self._trusted.get(name)
         if existing is None:
             self._trusted[name] = public_bytes
@@ -177,6 +180,16 @@ class TrustStore:
         # else: re-pinning the same key that's already pinned - a no-op,
         # not worth logging.
 
+    def pin(self, name: str, public_bytes: bytes):
+        """Pin `name` to `public_bytes`. Safe to call repeatedly with the
+        same key (a no-op past the first time). Raises
+        IdentityMismatchError if `name` is already pinned to a
+        DIFFERENT key - callers must not treat that as routine and
+        silently move on; use repin() if the change has actually been
+        verified out-of-band."""
+        with self._lock:
+            self._pin_unlocked(name, public_bytes)
+
     def repin(self, name: str, public_bytes: bytes):
         """Explicitly overwrite an existing pin with a new key, bypassing
         the mismatch check in pin(). Only call this after the change has
@@ -185,15 +198,16 @@ class TrustStore:
         deliberate, separately-named action a caller has to opt into,
         rather than something that can happen as a side effect of an
         ordinary pin() call."""
-        existing = self._trusted.get(name)
-        self._trusted[name] = public_bytes
-        security_logger.security(
-            EventCode.IDENTITY_PINNED,
-            "identity re-pinned after verified key change",
-            peer_name=name,
-            old_fingerprint=_fingerprint(existing) if existing else None,
-            fingerprint=_fingerprint(public_bytes),
-        )
+        with self._lock:
+            existing = self._trusted.get(name)
+            self._trusted[name] = public_bytes
+            security_logger.security(
+                EventCode.IDENTITY_PINNED,
+                "identity re-pinned after verified key change",
+                peer_name=name,
+                old_fingerprint=_fingerprint(existing) if existing else None,
+                fingerprint=_fingerprint(public_bytes),
+            )
 
     def get(self, name: str):
         raw = self._trusted.get(name)
@@ -253,9 +267,10 @@ class TrustStore:
             if answer != "y":
                 print_fn(f"[{label}] declined to trust '{peer_name}'. Aborting.")
                 return False, False
-            self.pin(peer_name, peer_pubkey)
             if save_path:
-                self.save(save_path)
+                self.pin_and_save(peer_name, peer_pubkey, save_path)
+            else:
+                self.pin(peer_name, peer_pubkey)
             print_fn(f"[{label}] TOFU: pinned new identity '{peer_name}' ({fp})")
             return True, False
 
@@ -269,13 +284,32 @@ class TrustStore:
 
         return True, False
 
-    def save(self, path: str):
+    def _save_unlocked(self, path: str):
         data = {name: raw.hex() for name, raw in self._trusted.items()}
         target = Path(path)
         tmp = target.with_name(target.name + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(data, indent=2))
+                fd = -1
+        finally:
+            if fd != -1:
+                os.close(fd)
         os.replace(tmp, target)
         os.chmod(target, 0o600)
+
+    def save(self, path: str):
+        with self._lock:
+            self._save_unlocked(path)
+
+    def pin_and_save(self, name: str, public_bytes: bytes, path: str):
+        """Atomically pin and persist so concurrent handlers cannot lose or
+        overwrite each other's updates."""
+        with self._lock:
+            self._pin_unlocked(name, public_bytes)
+            self._save_unlocked(path)
 
     @classmethod
     def load(cls, path: str) -> "TrustStore":
