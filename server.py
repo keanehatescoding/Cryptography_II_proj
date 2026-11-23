@@ -13,6 +13,7 @@ Usage:
 import getpass
 import socket
 import sys
+import threading
 from pathlib import Path
 
 import transport
@@ -172,8 +173,11 @@ def main():
                 conn.close()
                 continue
             print(f"[bob] connection from {addr}")
-            handle_connection(conn, addr, me, trust_store, limiter)
-            print("[bob] connection ended. Waiting for next peer...\n")
+            threading.Thread(
+                target=handle_connection,
+                args=(conn, addr, me, trust_store, limiter),
+                daemon=True,
+            ).start()
     except KeyboardInterrupt:
         print("\n[bob] shutting down.")
     finally:

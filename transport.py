@@ -50,9 +50,11 @@ def send_bytes(sock, data: bytes):
     sock.sendall(struct.pack(HEADER_FMT, len(data)) + data)
 
 
-def recv_exact(sock, n: int) -> bytes:
+def recv_exact(sock, n: int, timeout=None) -> bytes:
     buf = b""
     while len(buf) < n:
+        if timeout is not None:
+            sock.settimeout(timeout)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise ConnectionError("Connection closed while reading.")

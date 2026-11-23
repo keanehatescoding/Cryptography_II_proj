@@ -105,6 +105,7 @@ class Identity:
             encryption_algorithm=encryption,
         )
         key_path.write_bytes(pem)
+        os.chmod(key_path, 0o600)
         return str(key_path)
 
     @classmethod
@@ -270,7 +271,11 @@ class TrustStore:
 
     def save(self, path: str):
         data = {name: raw.hex() for name, raw in self._trusted.items()}
-        Path(path).write_text(json.dumps(data, indent=2))
+        target = Path(path)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
 
     @classmethod
     def load(cls, path: str) -> "TrustStore":

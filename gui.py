@@ -45,7 +45,7 @@ from handshake import (
 from identity import Identity, TrustStore, fingerprint_for_bytes
 from rate_limiter import SQLiteRateLimiter
 from secure_channel import ReplayError, TamperError
-from audit_log import configure_logging
+from audit_log import configure_logging, EventCode, security_logger
 
 KEY_DIR = "./gui_keys"
 FILE_RECV_DIR = Path("./received_files")
@@ -183,8 +183,12 @@ def _notify_desktop(title: str, message: str, on_click=None) -> None:
             # audible bell + title badge still cover it.
         elif system == "Windows":
             _notify_windows(title, message, on_click=on_click)
-    except Exception:
-        pass
+    except Exception as e:
+        security_logger.security(
+            EventCode.NOTIFY_FAILED,
+            "desktop notification failed",
+            detail=str(e),
+        )
 
 
 # Shared across every _notify_windows() call, not per-call state: a Win32
@@ -284,7 +288,12 @@ def _notify_windows(title: str, message: str, on_click=None) -> None:
                 None,
             )
             win32gui.UpdateWindow(hwnd)
-        except Exception:
+        except Exception as e:
+            security_logger.security(
+                EventCode.NOTIFY_FAILED,
+                "desktop notification failed",
+                detail=str(e),
+            )
             return
 
         state = {"clicked": False, "done": False}
@@ -327,19 +336,31 @@ def _notify_windows(title: str, message: str, on_click=None) -> None:
                 time.sleep(0.05)
             if state["clicked"] and on_click is not None:
                 on_click()
-        except Exception:
-            pass
+        except Exception as e:
+            security_logger.security(
+                EventCode.NOTIFY_FAILED,
+                "desktop notification failed",
+                detail=str(e),
+            )
         finally:
             with _win_notify_state_lock:
                 _win_notify_state.pop(hwnd, None)
             try:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
-            except Exception:
-                pass
+            except Exception as e:
+                security_logger.security(
+                    EventCode.NOTIFY_FAILED,
+                    "desktop notification failed",
+                    detail=str(e),
+                )
             try:
                 win32gui.DestroyWindow(hwnd)
-            except Exception:
-                pass
+            except Exception as e:
+                security_logger.security(
+                    EventCode.NOTIFY_FAILED,
+                    "desktop notification failed",
+                    detail=str(e),
+                )
 
     threading.Thread(target=_show, daemon=True).start()
 
@@ -425,6 +446,7 @@ class PeerWorker(threading.Thread):
     # listening socket is now persistent across reconnects, so a single
     # stuck peer would otherwise block every later peer indefinitely.
     HANDSHAKE_TIMEOUT = 15.0
+    RECV_TIMEOUT = 300.0
 
     def __init__(
         self,
@@ -678,7 +700,7 @@ class PeerWorker(threading.Thread):
                 self.sock = None
                 continue
 
-            conn.settimeout(None)
+            conn.settimeout(self.RECV_TIMEOUT)
             self._limiter.record_success(ip)
             return True
 
@@ -704,7 +726,7 @@ class PeerWorker(threading.Thread):
             self.identity, self.trust_store, state, msg2
         )
         transport.send_json(self.sock, msg3.to_wire())
-        sock.settimeout(None)
+        sock.settimeout(self.RECV_TIMEOUT)
         return True
 
     def _exchange_identity_and_pin(self):
@@ -999,7 +1021,7 @@ class PeerWorker(threading.Thread):
                     self.emit(
                         "file_send_progress", name=path.name, sent=sent, total=size
                     )
-        except (ConnectionError, OSError) as e:
+        except (ConnectionError, OSError, transport.FrameError) as e:
             self.emit("file_send_failed", name=path.name, text=str(e))
             return
 

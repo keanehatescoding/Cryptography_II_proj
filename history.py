@@ -119,3 +119,4 @@ class EncryptedHistory:
         tmp_path = self._path.with_name(self._path.name + ".tmp")
         tmp_path.write_bytes(self._salt + nonce + ciphertext)
         os.replace(tmp_path, self._path)
+        os.chmod(self._path, 0o600)
