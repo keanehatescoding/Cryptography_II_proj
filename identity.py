@@ -107,10 +107,21 @@ class Identity:
         )
         fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as f:
+            # Restrict the file to owner-only access BEFORE writing the key
+            # material. os.fchmod is Unix-only in Python 3.10-3.12 (Windows
+            # support starts in 3.13), so fall back to os.chmod after the
+            # write there - the only supported way to set permissions on
+            # those platforms without leaving the key world-readable.
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            f = os.fdopen(fd, "wb")
+            fd = -1  # ownership transfers to the file object on success
+            try:
                 f.write(pem)
-                fd = -1
+            finally:
+                f.close()
+            if not hasattr(os, "fchmod"):
+                os.chmod(key_path, 0o600)
         finally:
             if fd != -1:
                 os.close(fd)
@@ -291,9 +302,10 @@ class TrustStore:
         tmp.unlink(missing_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(fd, "w") as f:
+            f = os.fdopen(fd, "w")
+            fd = -1  # ownership transfers to the file object on success
+            with f:
                 f.write(json.dumps(data, indent=2))
-                fd = -1
         finally:
             if fd != -1:
                 os.close(fd)

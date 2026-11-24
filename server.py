@@ -12,6 +12,7 @@ Usage:
 
 import getpass
 import queue
+import secrets
 import socket
 import sys
 import threading
@@ -32,6 +33,17 @@ from audit_log import configure_logging
 
 HOST, PORT = "127.0.0.1", 8000
 KEY_DIR = "./demo_keys"
+
+# How long a handler may block the console thread waiting for a TOFU
+# confirmation. The console thread cannot be interrupted by a peer
+# disconnecting, so without a bound a flood of unknown peers would pin
+# every handler slot forever waiting on input that will never come.
+HANDSHAKE_INPUT_TIMEOUT = 30.0
+
+# Backpressure on reply prompts: while the console thread is busy typing
+# one reply, the handler keeps reading and queueing more. Cap that so one
+# peer cannot grow the retained message backlog without limit.
+MAX_PENDING_REPLIES = 64
 
 
 def load_or_create_identity(name: str) -> Identity:

@@ -120,9 +120,10 @@ class EncryptedHistory:
         tmp_path.unlink(missing_ok=True)
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(fd, "wb") as f:
+            f = os.fdopen(fd, "wb")
+            fd = -1  # ownership transfers to the file object on success
+            with f:
                 f.write(self._salt + nonce + ciphertext)
-                fd = -1
         finally:
             if fd != -1:
                 os.close(fd)
