@@ -79,6 +79,8 @@ class EventCode(str, Enum):
     FRAME_OVERSIZE_REJECTED = "frame_oversize_rejected"
     FRAME_MALFORMED = "frame_malformed"
 
+    # Notifications
+    NOTIFY_FAILED = "notify_failed"
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:

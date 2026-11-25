@@ -7,3 +7,4 @@ received_files/
 __pycache__
 .venv
 secure_comms_audit.log
+*_audit.log

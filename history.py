@@ -117,5 +117,15 @@ class EncryptedHistory:
         )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self._path.with_name(self._path.name + ".tmp")
-        tmp_path.write_bytes(self._salt + nonce + ciphertext)
+        tmp_path.unlink(missing_ok=True)
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            f = os.fdopen(fd, "wb")
+            fd = -1  # ownership transfers to the file object on success
+            with f:
+                f.write(self._salt + nonce + ciphertext)
+        finally:
+            if fd != -1:
+                os.close(fd)
         os.replace(tmp_path, self._path)
+        os.chmod(self._path, 0o600)

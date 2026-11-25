@@ -13,6 +13,9 @@ Run with:  python3 -m pytest test_secure_comms.py -v
        or: python3 test_secure_comms.py
 """
 
+import json
+import threading
+
 import pytest
 
 from identity import Identity, TrustStore, IdentityMismatchError
@@ -497,6 +500,36 @@ def test_repin_explicitly_overrides_an_existing_pin():
 
     assert trust_store.is_trusted("bob", new_key.public_bytes) is True
     assert trust_store.is_trusted("bob", old_key.public_bytes) is False
+
+
+def test_concurrent_pin_and_save_keeps_every_pin(tmp_path):
+    """The server shares one TrustStore across handler threads, so each
+    unknown peer can pin + save concurrently. That must be serialized: the
+    shared .tmp file must not race, no pin may be lost from the snapshot,
+    and the final file must be complete valid JSON."""
+    trust_store = TrustStore()
+    path = tmp_path / "bob_trust.json"
+    peers = [Identity(f"peer{i}") for i in range(8)]
+    errors = []
+
+    def pin(peer):
+        try:
+            trust_store.pin_and_save(peer.name, peer.public_bytes, str(path))
+        except Exception as e:  # noqa: BLE001 - asserted on below
+            errors.append(e)
+
+    threads = [threading.Thread(target=pin, args=(peer,)) for peer in peers]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    saved = json.loads(path.read_text())
+    assert set(saved) == {peer.name for peer in peers}
+    assert all(trust_store.is_trusted(p.name, p.public_bytes) for p in peers)
+    # The shared temp file must be gone once the last save completes.
+    assert not path.with_name(path.name + ".tmp").exists()
 
 
 # ---------------------------------------------------------------------------
