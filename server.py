@@ -100,25 +100,34 @@ class ConsoleDispatcher:
     def __init__(self):
         self._requests = queue.Queue()
         self._lock = threading.Lock()
-        self._peers = {}  # peer_name -> send function
+        # token -> (display name, send function). Two connections may
+        # authenticate as the same identity, so the name cannot be the key.
+        self._peers = {}
 
-    def register_peer(self, peer_name, send_fn):
+    def register_peer(self, token, peer_name, send_fn):
         with self._lock:
-            self._peers[peer_name] = send_fn
+            self._peers[token] = (peer_name, send_fn)
 
-    def unregister_peer(self, peer_name):
+    def unregister_peer(self, token):
         with self._lock:
-            self._peers.pop(peer_name, None)
+            self._peers.pop(token, None)
 
-    def request_input(self, prompt: str) -> str:
-        response = {}
+    def request_input(self, prompt: str, timeout: float | None = None) -> str:
+        state = {"value": "", "expired": False}
         event = threading.Event()
-        self._requests.put(("input", prompt, response, event))
-        event.wait()
-        return response.get("value", "")
+        self._requests.put(("input", prompt, state, event))
+        if not event.wait(timeout):
+            # The console may still be busy with an earlier prompt. Mark the
+            # request expired so a late answer cannot complete this request.
+            with self._lock:
+                state["expired"] = True
+            raise TimeoutError("timed out waiting for operator input")
+        if state["expired"]:
+            raise TimeoutError("input request expired")
+        return state["value"]
 
-    def request_reply(self, peer_name: str, message: str):
-        self._requests.put(("reply", peer_name, message))
+    def request_reply(self, token, peer_name: str, message: str):
+        self._requests.put(("reply", token, peer_name, message))
 
     def print(self, text: str):
         with self._lock:
@@ -130,21 +139,26 @@ class ConsoleDispatcher:
             if kind == "stop":
                 return
             if kind == "input":
-                prompt, response, event = args
+                prompt, state, event = args
+                if state["expired"]:
+                    continue  # requester gave up; do not consume terminal input
                 try:
-                    response["value"] = input(prompt)
+                    value = input(prompt)
                 except EOFError:
-                    response["value"] = ""
-                finally:
-                    event.set()
+                    value = ""
+                with self._lock:
+                    if not state["expired"]:
+                        state["value"] = value
+                event.set()
             elif kind == "reply":
-                peer_name, message = args
+                token, peer_name, message = args
                 self.print(f"[{peer_name}] {message}")
                 with self._lock:
-                    send_fn = self._peers.get(peer_name)
-                if send_fn is None:
+                    entry = self._peers.get(token)
+                if entry is None:
                     self.print(f"[bob] peer '{peer_name}' disconnected; dropping reply prompt.")
                     continue
+                _, send_fn = entry
                 try:
                     reply = input(f"[bob -> {peer_name}] > ")
                 except EOFError:
@@ -173,6 +187,7 @@ def handle_connection(
 ):
     ip = addr[0]
     peer_name = None
+    token = secrets.token_hex(16)
     try:
         conn.settimeout(HANDSHAKE_TIMEOUT)
         # --- TOFU: on first contact, learn and pin the peer's public key ---
@@ -184,7 +199,9 @@ def handle_connection(
             peer_pubkey,
             "bob",
             f"{KEY_DIR}/bob_trust.json",
-            input_fn=console.request_input,
+            input_fn=lambda prompt: console.request_input(
+                prompt, HANDSHAKE_INPUT_TIMEOUT
+            ),
             print_fn=console.print,
         )
         if not trusted:
@@ -211,19 +228,23 @@ def handle_connection(
         console.print("[bob] handshake complete - mutual authentication succeeded.")
         console.print(f"[bob] session secured with {peer_name}. Type replies when prompted.\n")
 
-        send_lock = threading.Lock()
+        send_lock = threading.Lock()   # orders socket writes
+        channel_lock = threading.Lock()  # serializes SecureChannel state
 
         def send_reply(reply: str):
             with send_lock:
-                transport.send_bytes(conn, channel.encrypt(reply.encode("utf-8")))
+                with channel_lock:
+                    frame = channel.encrypt(reply.encode("utf-8"))
+                transport.send_bytes(conn, frame)
 
-        console.register_peer(peer_name, send_reply)
+        console.register_peer(token, peer_name, send_reply)
         try:
             # --- Encrypted chat loop ---
             while True:
                 framed = transport.recv_bytes(conn)
                 try:
-                    plaintext = channel.decrypt(framed)
+                    with channel_lock:
+                        plaintext = channel.decrypt(framed)
                 except (ReplayError, TamperError) as e:
                     console.print(f"[bob] SECURITY ALERT: {e}")
                     continue
@@ -231,10 +252,12 @@ def handle_connection(
                 if text.strip().lower() == "/quit":
                     console.print(f"[{peer_name}] {text}")
                     break
-                console.request_reply(peer_name, text)
+                console.request_reply(token, peer_name, text)
         finally:
-            console.unregister_peer(peer_name)
+            console.unregister_peer(token)
 
+    except TimeoutError as e:
+        console.print(f"[bob] handshake input timed out: {e}")
     except HandshakeError as e:
         console.print(f"[bob] HANDSHAKE FAILED: {e}")
         limiter.record_failure(ip)
