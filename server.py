@@ -100,6 +100,7 @@ class ConsoleDispatcher:
     def __init__(self):
         self._requests = queue.Queue()
         self._lock = threading.Lock()
+        self._pending_replies = 0
         # token -> (display name, send function). Two connections may
         # authenticate as the same identity, so the name cannot be the key.
         self._peers = {}
@@ -126,8 +127,15 @@ class ConsoleDispatcher:
             raise TimeoutError("input request expired")
         return state["value"]
 
-    def request_reply(self, token, peer_name: str, message: str):
+    def request_reply(self, token, peer_name: str, message: str) -> bool:
+        # While the console is typing one reply the handler keeps reading.
+        # Cap the backlog so one peer cannot grow it without limit.
+        with self._lock:
+            if self._pending_replies >= MAX_PENDING_REPLIES:
+                return False
+            self._pending_replies += 1
         self._requests.put(("reply", token, peer_name, message))
+        return True
 
     def print(self, text: str):
         with self._lock:
@@ -151,6 +159,8 @@ class ConsoleDispatcher:
                         state["value"] = value
                 event.set()
             elif kind == "reply":
+                with self._lock:
+                    self._pending_replies -= 1
                 token, peer_name, message = args
                 self.print(f"[{peer_name}] {message}")
                 with self._lock:
@@ -252,7 +262,12 @@ def handle_connection(
                 if text.strip().lower() == "/quit":
                     console.print(f"[{peer_name}] {text}")
                     break
-                console.request_reply(token, peer_name, text)
+                if not console.request_reply(token, peer_name, text):
+                    console.print(
+                        f"[bob] reply backlog full for '{peer_name}' "
+                        f"({MAX_PENDING_REPLIES}); closing this session."
+                    )
+                    break
         finally:
             console.unregister_peer(token)
 

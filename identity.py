@@ -278,10 +278,20 @@ class TrustStore:
             if answer != "y":
                 print_fn(f"[{label}] declined to trust '{peer_name}'. Aborting.")
                 return False, False
-            if save_path:
-                self.pin_and_save(peer_name, peer_pubkey, save_path)
-            else:
-                self.pin(peer_name, peer_pubkey)
+            try:
+                if save_path:
+                    self.pin_and_save(peer_name, peer_pubkey, save_path)
+                else:
+                    self.pin(peer_name, peer_pubkey)
+            except IdentityMismatchError:
+                # Another connection may have pinned a different key while
+                # the operator was reading this prompt. Honour the documented
+                # mismatch result instead of raising out of the TOFU flow.
+                print_fn(
+                    f"[{label}] '{peer_name}' changed while you were "
+                    f"confirming - possible impersonation. Aborting."
+                )
+                return False, True
             print_fn(f"[{label}] TOFU: pinned new identity '{peer_name}' ({fp})")
             return True, False
 
