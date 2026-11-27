@@ -170,44 +170,28 @@ class SQLiteRateLimiter:
         the cooldown plus the size of the jump, and cleanup of aged-out
         attempt rows keeps happening.
 
-        The persisted high-water mark is the wall-clock value only (monotonic
-        references are per-process and meaningless across a restart), so after
-        a restart the effective clock is rebased onto the persisted wall
-        high-water mark and then advances again via the new process's
+        The persisted high-water mark is the effective (wall-clock-derived,
+        monotonic-advanced during rollback) value, not the raw wall clock.
+        Persisting the effective time keeps restarted cooldown/cleanup
+        durations aligned with the effective clock they were computed from.
+        Monotonic references are per-process and meaningless across a
+        restart, so after a restart the effective clock is rebased onto the
+        persisted value and then advances again via the new process's
         monotonic clock. A higher value persisted by another limiter instance
         is adopted instead of overwriting it.
         """
         if now is None:
             now = time.time()
-        mono_now = time.monotonic()
 
         # Adopt a higher watermark persisted by another instance without
         # regressing our own (possibly monotonic-advanced) effective time.
+        # Sample monotonic time after the persisted read so any wait before
+        # the read cannot advance the effective clock.
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = ?", ("clock_watermark",)
         ).fetchone()
         stored = float(row[0]) if row is not None else 0.0
-
-        current_eff = self._eff_base + (mono_now - self._mono_base)
-        if stored > current_eff:
-            self._eff_base = stored
-            self._mono_base = mono_now
-            current_eff = stored
-        if stored > self._wall_wm:
-            self._wall_wm = stored
-
-        # Conditional upsert: keep the greater of the stored and observed
-        # watermarks (never regress), then read the persisted value back.
-        self._conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = MAX(meta.value, excluded.value)",
-            ("clock_watermark", now),
-        )
-        self._conn.commit()
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key = ?", ("clock_watermark",)
-        ).fetchone()
-        stored = float(row[0]) if row is not None else max(stored, now)
+        mono_now = time.monotonic()
 
         current_eff = self._eff_base + (mono_now - self._mono_base)
         if stored > current_eff:
@@ -219,12 +203,41 @@ class SQLiteRateLimiter:
 
         if now >= current_eff:
             # Clock moved forward (or caught up): effective time is the
-            # observed/persisted watermark.
+            # observed wall-clock value.
+            effective = now
+        else:
+            # Backward (or still rolling back): keep advancing from monotonic
+            # time so cooldowns and cleanup age in real time.
+            effective = current_eff
+
+        # Conditional upsert: keep the greater of the stored and effective
+        # watermarks (never regress), then read the persisted value back.
+        self._conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = MAX(meta.value, excluded.value)",
+            ("clock_watermark", effective),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("clock_watermark",)
+        ).fetchone()
+        stored = float(row[0]) if row is not None else max(stored, effective)
+
+        # Sample monotonic time after the final persisted read; reuse this
+        # sample for adoption comparisons and the returned effective time.
+        mono_now = time.monotonic()
+        current_eff = self._eff_base + (mono_now - self._mono_base)
+        if stored > current_eff:
+            self._eff_base = stored
+            self._mono_base = mono_now
+            current_eff = stored
+        if stored > self._wall_wm:
+            self._wall_wm = stored
+
+        if now >= current_eff:
             self._eff_base = stored
             self._mono_base = mono_now
             return stored
-        # Backward (or still rolling back): keep advancing from monotonic
-        # time so cooldowns and cleanup age in real time.
         return self._eff_base + (mono_now - self._mono_base)
 
     def is_blocked(self, key: str, now: float | None = None) -> bool:

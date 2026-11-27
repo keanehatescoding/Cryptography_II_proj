@@ -22,6 +22,7 @@ import queue
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -972,67 +973,95 @@ class PeerWorker(threading.Thread):
 
     def _send_file(self, path_str: str):
         path = Path(path_str)
+        spool_path = None
 
-        # Read the file exactly once: this both computes the offer's
-        # SHA-256 and supplies the bytes to stream, so a file that is
-        # modified between hashing and sending can no longer make the
-        # offered hash disagree with the streamed bytes (TOCTOU), we
-        # don't pay for a second disk read, and non-seekable sources
-        # (FIFOs/pipes) that can't be read twice work too.
+        # Hash the source while copying it once to a temporary spool so we
+        # can stream the file to the recipient without retaining the whole
+        # payload in memory. This keeps a single read of the source (even
+        # for non-seekable inputs like FIFOs/pipes) and still hashes the
+        # exact bytes that are sent.
         try:
-            # Read at most MAX_FILE_SIZE + 1 bytes from one open handle so
-            # an oversized file is rejected before it can exhaust memory
-            # (and so non-seekable sources like FIFOs/pipes still work).
-            with open(path, "rb") as f:
-                data = f.read(MAX_FILE_SIZE + 1)
-        except OSError as e:
-            self.emit("file_send_failed", name=path.name, text=str(e))
-            return
+            hasher = hashlib.sha256()
+            size = 0
+            try:
+                with open(path, "rb") as src, tempfile.NamedTemporaryFile(
+                    delete=False
+                ) as spool:
+                    spool_path = Path(spool.name)
+                    while True:
+                        chunk = src.read(FILE_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_FILE_SIZE:
+                            self.emit(
+                                "file_send_failed",
+                                name=path.name,
+                                text=f"file is {_human_size(size)}, limit is "
+                                f"{_human_size(MAX_FILE_SIZE)}",
+                            )
+                            return
+                        hasher.update(chunk)
+                        spool.write(chunk)
+            except OSError as e:
+                self.emit("file_send_failed", name=path.name, text=str(e))
+                return
 
-        size = len(data)
-        if size > MAX_FILE_SIZE:
-            self.emit(
-                "file_send_failed",
-                name=path.name,
-                text=f"file is {_human_size(size)}, limit is "
-                f"{_human_size(MAX_FILE_SIZE)}",
-            )
-            return
-        if size <= 0:
-            self.emit(
-                "file_send_failed", name=path.name, text="file is empty; nothing to send"
-            )
-            return
-
-        digest = hashlib.sha256(data).hexdigest()
-
-        file_id = uuid.uuid4().bytes
-        # A reconnect mid-transfer swaps in a brand-new SecureChannel with
-        # no memory of this offer, so blindly continuing to send chunks
-        # under the old file_id would just have the receiver silently
-        # drop every one of them (no matching offer) while this thread
-        # still reports success. Pin to the channel that was live when the
-        # transfer started and bail out the moment it changes.
-        session = self.channel
-        try:
-            if self.channel is not session:
-                raise ConnectionError("connection was lost before the transfer started")
-            self._send_raw(_encode_file_offer(file_id, path.name, size, digest))
-            sent = 0
-            for offset in range(0, size, FILE_CHUNK_SIZE):
-                if self.channel is not session:
-                    raise ConnectionError("connection was lost mid-transfer")
-                chunk = data[offset : offset + FILE_CHUNK_SIZE]
-                self._send_raw(_encode_file_chunk(file_id, chunk))
-                sent += len(chunk)
+            if size <= 0:
                 self.emit(
-                    "file_send_progress", name=path.name, sent=sent, total=size
+                    "file_send_failed",
+                    name=path.name,
+                    text="file is empty; nothing to send",
                 )
-        except (ConnectionError, OSError, transport.FrameError) as e:
-            self.emit("file_send_failed", name=path.name, text=str(e))
-            return
+                return
 
-        self.emit("file_sent", name=path.name, size=size)
+            digest = hasher.hexdigest()
+
+            file_id = uuid.uuid4().bytes
+            # A reconnect mid-transfer swaps in a brand-new SecureChannel with
+            # no memory of this offer, so blindly continuing to send chunks
+            # under the old file_id would just have the receiver silently
+            # drop every one of them (no matching offer) while this thread
+            # still reports success. Pin to the channel that was live when the
+            # transfer started and bail out the moment it changes.
+            session = self.channel
+            try:
+                if self.channel is not session:
+                    raise ConnectionError(
+                        "connection was lost before the transfer started"
+                    )
+                self._send_raw(
+                    _encode_file_offer(file_id, path.name, size, digest)
+                )
+                sent = 0
+                with open(spool_path, "rb") as spool:
+                    while True:
+                        if self.channel is not session:
+                            raise ConnectionError(
+                                "connection was lost mid-transfer"
+                            )
+                        chunk = spool.read(FILE_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        self._send_raw(_encode_file_chunk(file_id, chunk))
+                        sent += len(chunk)
+                        self.emit(
+                            "file_send_progress",
+                            name=path.name,
+                            sent=sent,
+                            total=size,
+                        )
+            except (ConnectionError, OSError, transport.FrameError) as e:
+                self.emit("file_send_failed", name=path.name, text=str(e))
+                return
+
+            self.emit("file_sent", name=path.name, size=size)
+        finally:
+            if spool_path is not None:
+                try:
+                    spool_path.unlink()
+                except OSError:
+                    pass
 
     def stop(self):
         self._stop_event.set()
