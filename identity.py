@@ -36,7 +36,7 @@ def fingerprint_for_bytes(raw_public_bytes: bytes) -> str:
     import hashlib
 
     digest = hashlib.sha256(raw_public_bytes).hexdigest()
-    return ":".join(digest[i : i + 4] for i in range(0, 16, 4))
+    return ":".join(digest[i : i + 4] for i in range(0, 32, 4))
 
 
 # Backwards-compatible alias for the old private name.

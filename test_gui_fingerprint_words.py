@@ -32,16 +32,16 @@ def test_word_pair_matches_adjective_high_nibble_noun_low_nibble():
 
 
 def test_accepts_the_colon_grouped_fingerprint_format():
-    raw = bytes(range(8))
+    raw = bytes(range(16))
     plain = gui._fingerprint_to_words(raw.hex())
-    grouped = gui._fingerprint_to_words(":".join(raw.hex()[i : i + 4] for i in range(0, 16, 4)))
+    grouped = gui._fingerprint_to_words(":".join(raw.hex()[i : i + 4] for i in range(0, 32, 4)))
     assert plain == grouped
 
 
 def test_matches_the_real_identity_fingerprint_format(monkeypatch):
     fp = fingerprint_for_bytes(b"some fake public key bytes for this test")
     words = gui._fingerprint_to_words(fp)
-    assert len(words.split(" ")) == 8, "the 16-hex-char fingerprint is 8 bytes -> 8 word pairs"
+    assert len(words.split(" ")) == 16, "the 32-hex-char fingerprint is 16 bytes -> 16 word pairs"
     for pair in words.split(" "):
         adjective, noun = pair.split("-")
         assert adjective in gui._FINGERPRINT_ADJECTIVES
