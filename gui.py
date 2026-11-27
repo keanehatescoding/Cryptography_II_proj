@@ -980,7 +980,11 @@ class PeerWorker(threading.Thread):
         # don't pay for a second disk read, and non-seekable sources
         # (FIFOs/pipes) that can't be read twice work too.
         try:
-            data = path.read_bytes()
+            # Read at most MAX_FILE_SIZE + 1 bytes from one open handle so
+            # an oversized file is rejected before it can exhaust memory
+            # (and so non-seekable sources like FIFOs/pipes still work).
+            with open(path, "rb") as f:
+                data = f.read(MAX_FILE_SIZE + 1)
         except OSError as e:
             self.emit("file_send_failed", name=path.name, text=str(e))
             return
