@@ -1036,13 +1036,13 @@ class PeerWorker(threading.Thread):
                 sent = 0
                 with open(spool_path, "rb") as spool:
                     while True:
+                        chunk = spool.read(FILE_CHUNK_SIZE)
+                        if not chunk:
+                            break
                         if self.channel is not session:
                             raise ConnectionError(
                                 "connection was lost mid-transfer"
                             )
-                        chunk = spool.read(FILE_CHUNK_SIZE)
-                        if not chunk:
-                            break
                         self._send_raw(_encode_file_chunk(file_id, chunk))
                         sent += len(chunk)
                         self.emit(

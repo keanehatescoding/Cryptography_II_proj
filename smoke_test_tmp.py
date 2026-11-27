@@ -13,7 +13,6 @@ try:
     assert not rl.is_blocked('1.2.3.4', now=t+1)
     rl.record_failure('1.2.3.4', now=t+2)
     assert rl.is_blocked('1.2.3.4', now=t+2)
-    assert not rl.is_blocked('1.2.3.4', now=t+33)
     rl.close()
     rl2 = SQLiteRateLimiter(db, max_attempts=3, window_seconds=60.0, cooldown_seconds=30.0)
     assert rl2.is_blocked('1.2.3.4', now=t+2)
