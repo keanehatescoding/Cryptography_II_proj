@@ -86,7 +86,7 @@ def _encode_file_chunk(file_id: bytes, chunk: bytes) -> bytes:
     return bytes([MSG_FILE_CHUNK]) + file_id + chunk
 
 
-# Turns the 8-byte hex fingerprint (identity.py's fingerprint_for_bytes)
+# Turns the 16-byte hex fingerprint (identity.py's fingerprint_for_bytes)
 # into a spoken phrase for out-of-band verification - reading "brave-falcon
 # calm-opal ..." aloud over a call is far less error-prone than reading
 # hex nibbles one at a time, the same problem Signal's word-based safety
@@ -972,11 +972,20 @@ class PeerWorker(threading.Thread):
 
     def _send_file(self, path_str: str):
         path = Path(path_str)
+
+        # Read the file exactly once: this both computes the offer's
+        # SHA-256 and supplies the bytes to stream, so a file that is
+        # modified between hashing and sending can no longer make the
+        # offered hash disagree with the streamed bytes (TOCTOU), we
+        # don't pay for a second disk read, and non-seekable sources
+        # (FIFOs/pipes) that can't be read twice work too.
         try:
-            size = path.stat().st_size
+            data = path.read_bytes()
         except OSError as e:
             self.emit("file_send_failed", name=path.name, text=str(e))
             return
+
+        size = len(data)
         if size > MAX_FILE_SIZE:
             self.emit(
                 "file_send_failed",
@@ -991,14 +1000,7 @@ class PeerWorker(threading.Thread):
             )
             return
 
-        digest = hashlib.sha256()
-        try:
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(FILE_CHUNK_SIZE), b""):
-                    digest.update(chunk)
-        except OSError as e:
-            self.emit("file_send_failed", name=path.name, text=str(e))
-            return
+        digest = hashlib.sha256(data).hexdigest()
 
         file_id = uuid.uuid4().bytes
         # A reconnect mid-transfer swaps in a brand-new SecureChannel with
@@ -1011,17 +1013,17 @@ class PeerWorker(threading.Thread):
         try:
             if self.channel is not session:
                 raise ConnectionError("connection was lost before the transfer started")
-            self._send_raw(_encode_file_offer(file_id, path.name, size, digest.hexdigest()))
+            self._send_raw(_encode_file_offer(file_id, path.name, size, digest))
             sent = 0
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(FILE_CHUNK_SIZE), b""):
-                    if self.channel is not session:
-                        raise ConnectionError("connection was lost mid-transfer")
-                    self._send_raw(_encode_file_chunk(file_id, chunk))
-                    sent += len(chunk)
-                    self.emit(
-                        "file_send_progress", name=path.name, sent=sent, total=size
-                    )
+            for offset in range(0, size, FILE_CHUNK_SIZE):
+                if self.channel is not session:
+                    raise ConnectionError("connection was lost mid-transfer")
+                chunk = data[offset : offset + FILE_CHUNK_SIZE]
+                self._send_raw(_encode_file_chunk(file_id, chunk))
+                sent += len(chunk)
+                self.emit(
+                    "file_send_progress", name=path.name, sent=sent, total=size
+                )
         except (ConnectionError, OSError, transport.FrameError) as e:
             self.emit("file_send_failed", name=path.name, text=str(e))
             return

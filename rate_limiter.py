@@ -144,11 +144,39 @@ class SQLiteRateLimiter:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_blocks_until ON blocks(blocked_until)"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value REAL NOT NULL)"
+        )
         self._conn.commit()
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("clock_watermark",)
+        ).fetchone()
+        self._clock_watermark = float(row[0]) if row is not None else 0.0
+
+    def _effective_now(self, now: float | None) -> float:
+        """Mitigate backward wall-clock jumps: never let the observed
+        time move backwards. A system clock that jumps into the past
+        (NTP correction, manual change, VM pause/resume) must not be
+        allowed to extend an existing block or suppress cleanup of aged-out
+        attempt rows. Clamping to the high-water mark of wall-clock time
+        we've seen keeps both of those from happening."""
+        if now is None:
+            now = time.time()
+        if now > self._clock_watermark:
+            self._clock_watermark = now
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("clock_watermark", self._clock_watermark),
+            )
+            self._conn.commit()
+        else:
+            now = self._clock_watermark
+        return now
 
     def is_blocked(self, key: str, now: float | None = None) -> bool:
-        now = now if now is not None else time.time()
         with self._lock:
+            now = self._effective_now(now)
             row = self._conn.execute(
                 "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
             ).fetchone()
@@ -161,8 +189,8 @@ class SQLiteRateLimiter:
             return True
 
     def seconds_until_unblocked(self, key: str, now: float | None = None) -> float:
-        now = now if now is not None else time.time()
         with self._lock:
+            now = self._effective_now(now)
             row = self._conn.execute(
                 "SELECT blocked_until FROM blocks WHERE key = ?", (key,)
             ).fetchone()
@@ -171,8 +199,8 @@ class SQLiteRateLimiter:
             return row[0] - now
 
     def record_failure(self, key: str, now: float | None = None):
-        now = now if now is not None else time.time()
         with self._lock:
+            now = self._effective_now(now)
             self._conn.execute("INSERT INTO attempts (key, ts) VALUES (?, ?)", (key, now))
             # Deleted GLOBALLY (every key), not just this one: an attacker
             # who rotates through many source addresses, each failing a few
